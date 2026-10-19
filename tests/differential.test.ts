@@ -16,6 +16,11 @@ try {
   DatabaseSync = undefined;
 }
 
+/** `FUZZ_SEEDS=n npm run fuzz` runs n extra seeds per fuzzer instead of the quick default set. */
+const FUZZ_SEEDS = Number(process.env.FUZZ_SEEDS ?? 0);
+const seeds = (base: number, defaults: number[]): number[] =>
+  FUZZ_SEEDS > 0 ? Array.from({ length: FUZZ_SEEDS }, (_, i) => base + i) : defaults;
+
 class Random {
   private s: number;
   constructor(seed: number) {
@@ -371,7 +376,7 @@ function canonical(rows: unknown[][], ordered: boolean): string[] {
 }
 
 describe.skipIf(!DatabaseSync)("differential testing against SQLite", () => {
-  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+  for (const seed of seeds(1000, [1, 2, 3, 4, 5, 6, 7, 8])) {
     it(`agrees with SQLite on random queries (seed ${seed})`, () => {
       const dataRandom = new Random(seed);
       const setupWithIndexes = setupSql(dataRandom, true);
@@ -488,7 +493,7 @@ function tableContents(run: (sql: string) => unknown[][]): Record<string, string
 }
 
 describe.skipIf(!DatabaseSync)("differential DML testing against SQLite", () => {
-  for (const seed of [11, 12, 13, 14, 15, 16]) {
+  for (const seed of seeds(50_000, [11, 12, 13, 14, 15, 16])) {
     it(`applies random INSERT / UPDATE / DELETE identically (seed ${seed})`, () => {
       const sqlite = new DatabaseSync!(":memory:");
       sqlite.exec(setupSql(new Random(seed), false));

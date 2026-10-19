@@ -12,7 +12,12 @@
     "rootDir": ".",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src", "tests", "examples"]
+  "include": [
+    "src",
+    "tests"
+  ]
 }

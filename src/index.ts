@@ -10,3 +10,5 @@ export type { Row, SqlValue } from "./values.js";
 export type * from "./ast.js";
 export { renderPlan } from "./planner.js";
 export type { PlanNode } from "./planner.js";
+export { formatCsv, formatJson, formatResult, formatTable } from "./format.js";
+export type { OutputMode } from "./format.js";

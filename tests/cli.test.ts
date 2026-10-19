@@ -2,10 +2,11 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { displayWidth, formatCsv, formatJson, formatLines, formatTable } from "../src/format.js";
 
-const root = join(import.meta.dirname, "..");
+const root = fileURLToPath(new URL("..", import.meta.url));
 const cli = join(root, "dist", "cli.js");
 const dir = mkdtempSync(join(tmpdir(), "minisql-cli-"));
 

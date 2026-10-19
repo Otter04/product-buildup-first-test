@@ -1,25 +1,7 @@
 {
   "name": "minisql",
   "version": "0.1.0",
-  "description": "A small, dependency-free relational SQL database engine written in TypeScript \u2014 lexer, parser, planner, executor, indexes, transactions and a REPL.",
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "bin": {
-    "minisql": "dist/cli.js"
-  },
-  "files": [
-    "dist"
-  ],
-  "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "repl": "npm run build && node dist/cli.js",
-    "prepublishOnly": "npm run build",
-    "bench": "npm run build && node --no-warnings bench/bench.mjs"
-  },
+  "description": "A small, dependency-free relational SQL database engine written in TypeScript — lexer, parser, planner, executor, indexes, transactions and a REPL.",
   "keywords": [
     "sql",
     "database",
@@ -28,16 +10,19 @@
     "query-engine",
     "typescript"
   ],
+  "homepage": "https://github.com/otter04/product-buildup-first-test#readme",
+  "bugs": {
+    "url": "https://github.com/otter04/product-buildup-first-test/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/otter04/product-buildup-first-test.git"
+  },
   "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  },
-  "devDependencies": {
-    "@types/node": "^22.20.5",
-    "@vitest/coverage-v8": "^2.1.9",
-    "typescript": "^5.9.3",
-    "vitest": "^2.1.9"
-  },
+  "author": "otter04",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -47,5 +32,32 @@
       "types": "./dist/node.d.ts",
       "default": "./dist/node.js"
     }
+  },
+  "bin": {
+    "minisql": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "repl": "npm run build && node dist/cli.js",
+    "prepublishOnly": "npm run build",
+    "bench": "npm run build && node --no-warnings bench/bench.mjs",
+    "examples": "npm run build && node examples/quickstart.mjs && node examples/analytics.mjs && node examples/todo.mjs list",
+    "fuzz": "vitest run tests/differential.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@vitest/coverage-v8": "^2.1.9",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
   }
 }
