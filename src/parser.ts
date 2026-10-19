@@ -12,7 +12,9 @@ import type {
   DropIndexStatement,
   DropTableStatement,
   Expr,
+  FrameBound,
   FromItem,
+  FunctionCallExpr,
   InsertStatement,
   JoinType,
   OrderByItem,
@@ -22,6 +24,7 @@ import type {
   Statement,
   TableConstraint,
   UpdateStatement,
+  WindowSpec,
 } from "./ast.js";
 import { SqlSyntaxError } from "./errors.js";
 import { tokenize, type Token, type TokenType } from "./lexer.js";
@@ -32,6 +35,15 @@ import { tokenize, type Token, type TokenType } from "./lexer.js";
  */
 const SOFT_KEYWORDS = new Set([
   "ADD",
+  "CURRENT",
+  "FOLLOWING",
+  "OVER",
+  "PARTITION",
+  "PRECEDING",
+  "RANGE",
+  "ROW",
+  "ROWS",
+  "UNBOUNDED",
   "AUTOINCREMENT",
   "COLUMN",
   "DESCRIBE",
@@ -548,22 +560,7 @@ export class Parser {
       compounds.push({ op, core: this.parseSelectCoreOrParenthesized() });
     }
 
-    const orderBy: OrderByItem[] = [];
-    if (this.matchKeyword("ORDER", "BY")) {
-      do {
-        const expr = this.parseExpr();
-        let direction: "ASC" | "DESC" = "ASC";
-        if (this.matchKeyword("DESC")) direction = "DESC";
-        else this.matchKeyword("ASC");
-        let nulls: "FIRST" | "LAST" | undefined;
-        if (this.matchKeyword("NULLS")) {
-          if (this.matchKeyword("FIRST")) nulls = "FIRST";
-          else if (this.matchKeyword("LAST")) nulls = "LAST";
-          else this.fail("Expected FIRST or LAST after NULLS");
-        }
-        orderBy.push({ expr, direction, nulls });
-      } while (this.matchPunct(","));
-    }
+    const orderBy = this.matchKeyword("ORDER", "BY") ? this.parseOrderByItems() : [];
 
     let limit: Expr | undefined;
     let offset: Expr | undefined;
@@ -580,6 +577,24 @@ export class Parser {
     }
 
     return { type: "select", recursive, with: withClause, core, compounds, orderBy, limit, offset };
+  }
+
+  private parseOrderByItems(): OrderByItem[] {
+    const items: OrderByItem[] = [];
+    do {
+      const expr = this.parseExpr();
+      let direction: "ASC" | "DESC" = "ASC";
+      if (this.matchKeyword("DESC")) direction = "DESC";
+      else this.matchKeyword("ASC");
+      let nulls: "FIRST" | "LAST" | undefined;
+      if (this.matchKeyword("NULLS")) {
+        if (this.matchKeyword("FIRST")) nulls = "FIRST";
+        else if (this.matchKeyword("LAST")) nulls = "LAST";
+        else this.fail("Expected FIRST or LAST after NULLS");
+      }
+      items.push({ expr, direction, nulls });
+    } while (this.matchPunct(","));
+    return items;
   }
 
   private parseSelectCoreOrParenthesized(): SelectCore {
@@ -984,7 +999,12 @@ export class Parser {
     if (this.isOperator("*")) {
       this.next();
       this.expectPunct(")");
-      return { kind: "function", name, args: [], distinct: false, star: true };
+      const call: FunctionCallExpr = { kind: "function", name, args: [], distinct: false, star: true };
+      if (this.isKeyword("OVER") && this.isPunct("(", 1)) {
+        this.next();
+        call.over = this.parseWindowSpec();
+      }
+      return call;
     }
     const distinct = this.matchKeyword("DISTINCT");
     const args: Expr[] = [];
@@ -993,7 +1013,60 @@ export class Parser {
       while (this.matchPunct(","));
     }
     this.expectPunct(")");
-    return { kind: "function", name, args, distinct, star: false };
+    const call: FunctionCallExpr = { kind: "function", name, args, distinct, star: false };
+    if (this.isKeyword("OVER") && this.isPunct("(", 1)) {
+      this.next();
+      call.over = this.parseWindowSpec();
+    }
+    return call;
+  }
+
+  private parseWindowSpec(): WindowSpec {
+    this.expectPunct("(");
+    const spec: WindowSpec = { partitionBy: [], orderBy: [] };
+    if (this.matchKeyword("PARTITION")) {
+      this.expectKeyword("BY");
+      do spec.partitionBy.push(this.parseExpr());
+      while (this.matchPunct(","));
+    }
+    if (this.matchKeyword("ORDER", "BY")) spec.orderBy = this.parseOrderByItems();
+    if (this.isKeyword("ROWS") || this.isKeyword("RANGE")) {
+      const unit = this.next().value as "ROWS" | "RANGE";
+      let start: FrameBound;
+      let end: FrameBound;
+      if (this.matchKeyword("BETWEEN")) {
+        start = this.parseFrameBound();
+        this.expectKeyword("AND");
+        end = this.parseFrameBound();
+      } else {
+        start = this.parseFrameBound();
+        end = { kind: "currentRow" };
+      }
+      if (start.kind === "unboundedFollowing") this.fail("A window frame cannot start at UNBOUNDED FOLLOWING");
+      if (end.kind === "unboundedPreceding") this.fail("A window frame cannot end at UNBOUNDED PRECEDING");
+      if (unit === "RANGE" && (start.kind === "preceding" || start.kind === "following" || end.kind === "preceding" || end.kind === "following")) {
+        if (spec.orderBy.length !== 1) this.fail("RANGE with an offset requires exactly one ORDER BY expression");
+      }
+      spec.frame = { unit, start, end };
+    }
+    this.expectPunct(")");
+    return spec;
+  }
+
+  private parseFrameBound(): FrameBound {
+    if (this.matchKeyword("UNBOUNDED")) {
+      if (this.matchKeyword("PRECEDING")) return { kind: "unboundedPreceding" };
+      this.expectKeyword("FOLLOWING");
+      return { kind: "unboundedFollowing" };
+    }
+    if (this.matchKeyword("CURRENT")) {
+      this.expectKeyword("ROW");
+      return { kind: "currentRow" };
+    }
+    const offset = this.parseAdditive();
+    if (this.matchKeyword("PRECEDING")) return { kind: "preceding", offset };
+    this.expectKeyword("FOLLOWING");
+    return { kind: "following", offset };
   }
 
   private parseCase(): Expr {

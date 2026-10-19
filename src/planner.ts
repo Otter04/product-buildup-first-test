@@ -1,6 +1,7 @@
 import type {
   CommonTableExpr,
   Expr,
+  FrameBound,
   FromItem,
   FunctionCallExpr,
   JoinType,
@@ -12,6 +13,7 @@ import type {
 } from "./ast.js";
 import {
   collectAggregates,
+  collectWindows,
   compileExpr,
   containsSubquery,
   exprToSql,
@@ -30,6 +32,7 @@ import {
 import { SqlCatalogError, SqlRuntimeError } from "./errors.js";
 import { createAccumulator, type Accumulator } from "./functions.js";
 import type { Catalog, Index, Table } from "./storage.js";
+import { evaluateWindow, validateWindowCall, type CompiledWindow } from "./window.js";
 import { compareValues, rowKey, toBool, toNumber, type SqlValue } from "./values.js";
 
 /** A node of the human-readable query plan produced by EXPLAIN. */
@@ -244,8 +247,8 @@ export class QueryCompiler {
         return {
           plan: { label: `SCAN ${table.name}${aliasLabel}${filterLabel}`, children: [] },
           scan: function* () {
-            for (const [id, row] of table.rows) {
-              if (filter && !filter({ row })) continue;
+            for (const id of table.rowIds()) {
+              if (filter && !filter({ row: table.rows.get(id)! })) continue;
               yield id;
             }
           },
@@ -258,7 +261,7 @@ export class QueryCompiler {
         plan: { label: `SEARCH ${table.name}${aliasLabel} USING INDEX ${access.index.name}${filterLabel}`, children: [] },
         scan: function* () {
           const ids = indexRowIds(access.index, table, eqAlternatives, lower, upper, { row: EMPTY_ROW });
-          for (const id of ids ?? table.rows.keys()) {
+          for (const id of ids ?? table.rowIds()) {
             const row = table.rows.get(id);
             if (!row) continue;
             if (filter && !filter({ row })) continue;
@@ -566,6 +569,15 @@ export class QueryCompiler {
       return { item: o, pos };
     });
 
+    const misplacedWindows = (expr: Expr | undefined, clause: string): void => {
+      if (!expr) return;
+      const found: FunctionCallExpr[] = [];
+      collectWindows(expr, found);
+      if (found.length) throw new SqlRuntimeError(`Window functions are not allowed in ${clause}`);
+    };
+    misplacedWindows(core.having, "HAVING");
+    for (const g of groupExprs) misplacedWindows(g, "GROUP BY");
+
     const aggCalls: FunctionCallExpr[] = [];
     for (const i of items) collectAggregates(i.expr, aggCalls);
     if (core.having) collectAggregates(core.having, aggCalls);
@@ -600,6 +612,36 @@ export class QueryCompiler {
       };
     }
 
+    // Window functions are evaluated over the (possibly aggregated) rows and
+    // appended to them as hidden columns before projection.
+    const windowCalls: FunctionCallExpr[] = [];
+    for (const i of items) collectWindows(i.expr, windowCalls);
+    for (const t of orderTerms) if (t.pos === undefined) collectWindows(t.item.expr, windowCalls);
+    let windows: CompiledWindow[] = [];
+    if (windowCalls.length) {
+      windows = windowCalls.map((call) => {
+        validateWindowCall(call);
+        const spec = call.over!;
+        const constScope = new Scope([], outer, boundary);
+        const offset = (b: FrameBound): Compiled | undefined =>
+          b.kind === "preceding" || b.kind === "following" ? compileExpr(b.offset, constScope, ctx) : undefined;
+        return {
+          call,
+          args: call.args.map((a) => compileExpr(a, projScope, ctx)),
+          partitionBy: spec.partitionBy.map((p) => compileExpr(p, projScope, ctx)),
+          orderBy: spec.orderBy.map((o) => ({ expr: compileExpr(o.expr, projScope, ctx), direction: o.direction, nulls: o.nulls })),
+          frame: spec.frame && { ...spec.frame, startOffset: offset(spec.frame.start), endOffset: offset(spec.frame.end) },
+        };
+      });
+      const base = projScope.columns.length;
+      const windowSlots = new Map<FunctionCallExpr, number>();
+      const hidden: ColumnInfo[] = windowCalls.map((call, i) => {
+        windowSlots.set(call, base + i);
+        return { name: `__win${i}`, hidden: true };
+      });
+      projScope = new Scope([...projScope.columns, ...hidden], outer, boundary, projScope.aggregates, windowSlots);
+    }
+
     const projections = items.map((i) => compileExpr(i.expr, projScope, ctx));
     const sortable: SortSpec[] = [];
     const sortKeyExprs: Compiled[] = [];
@@ -625,9 +667,10 @@ export class QueryCompiler {
       }
     }
 
-    function* produce(env: Env | undefined): Generator<{ out: SqlValue[]; keys: SqlValue[] }> {
+    /** Rows ready for projection: filtered source rows, or groups after HAVING. */
+    function* grouped(env: Env | undefined): Generator<SqlValue[]> {
       if (!aggregation) {
-        for (const row of filtered(env)) yield project({ row, outer: env });
+        yield* filtered(env);
         return;
       }
       const groups = new Map<string, { rep: SqlValue[]; accs: Accumulator[] }>();
@@ -648,9 +691,20 @@ export class QueryCompiler {
       }
       for (const group of groups.values()) {
         const aggRow = [...group.rep, ...group.accs.map((a) => a.result())];
-        const aggEnv = { row: aggRow, outer: env };
-        if (aggregation.having && !aggregation.having(aggEnv)) continue;
-        yield project(aggEnv);
+        if (aggregation.having && !aggregation.having({ row: aggRow, outer: env })) continue;
+        yield aggRow;
+      }
+    }
+
+    function* produce(env: Env | undefined): Generator<{ out: SqlValue[]; keys: SqlValue[] }> {
+      if (!windows.length) {
+        for (const row of grouped(env)) yield project({ row, outer: env });
+        return;
+      }
+      const all = [...grouped(env)];
+      const values = windows.map((w) => evaluateWindow(w, all, env));
+      for (let i = 0; i < all.length; i++) {
+        yield project({ row: all[i]!.concat(values.map((v) => v[i]!)), outer: env });
       }
     }
 
@@ -674,6 +728,7 @@ export class QueryCompiler {
       plan = { label: label + aggs, children: [plan] };
       if (core.having) plan = { label: `HAVING ${exprToSql(core.having)}`, children: [plan] };
     }
+    if (windowCalls.length) plan = { label: `WINDOW [${windowCalls.map(exprToSql).join(", ")}]`, children: [plan] };
     plan = { label: `PROJECT ${columns.join(", ")}`, children: [plan] };
     if (distinct) plan = { label: "DISTINCT", children: [plan] };
 
@@ -856,7 +911,7 @@ export class QueryCompiler {
         columns: leaf.columns,
         plan: { label: `SCAN ${table.name}${aliasLabel}${filterLabel}`, children: [] },
         rows: function* (env) {
-          for (const row of table.rows.values()) {
+          for (const row of table.scan()) {
             if (filter && !filter({ row, outer: env })) continue;
             yield row;
           }
@@ -887,7 +942,7 @@ export class QueryCompiler {
                 if (row) yield row;
               }
             })()
-          : table.rows.values();
+          : table.scan();
         for (const row of source) {
           if (filter && !filter({ row, outer: env })) continue;
           yield row;
@@ -946,7 +1001,7 @@ export class QueryCompiler {
               let matched = false;
               if (key !== null) {
                 const pv = probeValue(key, table, colIdx);
-                const ids: Iterable<number> = pv === undefined ? table.rows.keys() : index.lookup([pv]);
+                const ids: Iterable<number> = pv === undefined ? table.rowIds() : index.lookup([pv]);
                 for (const id of ids) {
                   const r = table.rows.get(id);
                   if (!r) continue;

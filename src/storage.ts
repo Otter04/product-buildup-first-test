@@ -173,6 +173,27 @@ export class Table {
     return this.indexes.find((i) => i.implicit && i.name.startsWith("pk_"));
   }
 
+  /**
+   * The index rows are clustered by, if any: like SQLite's rowid tables, a
+   * table with a single-column INTEGER PRIMARY KEY is scanned in key order.
+   */
+  get clusteredIndex(): Index | undefined {
+    const pk = this.primaryKey;
+    if (pk && pk.columnIndexes.length === 1 && this.columns[pk.columnIndexes[0]!]!.type === "INTEGER") return pk;
+    return undefined;
+  }
+
+  /** Row ids in scan order (primary key order for clustered tables, insertion order otherwise). */
+  rowIds(): Iterable<number> {
+    const clustered = this.clusteredIndex;
+    return clustered ? clustered.scan() : this.rows.keys();
+  }
+
+  /** All rows in scan order. */
+  *scan(): Generator<SqlValue[]> {
+    for (const id of this.rowIds()) yield this.rows.get(id)!;
+  }
+
   get autoIncrementColumn(): number {
     return this.columns.findIndex((c) => c.autoIncrement);
   }
@@ -191,9 +212,30 @@ export class Table {
     }
   }
 
+  /**
+   * The row id a row is stored under. For clustered tables it is the INTEGER
+   * PRIMARY KEY value itself (a "rowid alias", as in SQLite), so secondary
+   * indexes break ties by primary key.
+   */
+  private rowIdFor(row: SqlValue[]): number {
+    const clustered = this.clusteredIndex;
+    if (clustered) {
+      const key = row[clustered.columnIndexes[0]!];
+      if (typeof key === "number") return key;
+    }
+    return this.nextRowId++;
+  }
+
+  /** Stores a row without constraint checks or journaling (used when loading snapshots). */
+  load(row: SqlValue[]): void {
+    const rowId = this.rowIdFor(row);
+    this.rows.set(rowId, row);
+    for (const index of this.indexes) index.tree.set(index.keyFor(row, rowId), rowId);
+  }
+
   insert(row: SqlValue[], journal: Journal): number {
     this.checkUnique(row);
-    const rowId = this.nextRowId++;
+    const rowId = this.rowIdFor(row);
     this.rows.set(rowId, row);
     for (const index of this.indexes) index.tree.set(index.keyFor(row, rowId), rowId);
     journal.record(() => {
@@ -203,20 +245,25 @@ export class Table {
     return rowId;
   }
 
-  update(rowId: number, newRow: SqlValue[], journal: Journal): void {
+  /** Replaces a row. Returns its (possibly new) row id: changing a clustered key moves the row. */
+  update(rowId: number, newRow: SqlValue[], journal: Journal): number {
     const oldRow = this.rows.get(rowId);
     if (!oldRow) throw new Error(`Row ${rowId} not found in ${this.name}`);
     this.checkUnique(newRow, rowId);
-    this.replaceRow(rowId, oldRow, newRow);
-    journal.record(() => this.replaceRow(rowId, newRow, oldRow));
+    const clustered = this.clusteredIndex;
+    const newId = clustered ? (newRow[clustered.columnIndexes[0]!] as number) : rowId;
+    this.replaceRow(rowId, oldRow, newId, newRow);
+    journal.record(() => this.replaceRow(newId, newRow, rowId, oldRow));
+    return newId;
   }
 
-  private replaceRow(rowId: number, oldRow: SqlValue[], newRow: SqlValue[]): void {
+  private replaceRow(oldId: number, oldRow: SqlValue[], newId: number, newRow: SqlValue[]): void {
     for (const index of this.indexes) {
-      index.tree.delete(index.keyFor(oldRow, rowId));
-      index.tree.set(index.keyFor(newRow, rowId), rowId);
+      index.tree.delete(index.keyFor(oldRow, oldId));
+      index.tree.set(index.keyFor(newRow, newId), newId);
     }
-    this.rows.set(rowId, newRow);
+    if (oldId !== newId) this.rows.delete(oldId);
+    this.rows.set(newId, newRow);
   }
 
   delete(rowId: number, journal: Journal): void {

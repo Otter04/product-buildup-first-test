@@ -56,11 +56,12 @@ const TABLES: TableSpec[] = [
 function setupSql(r: Random, withIndexes: boolean): string {
   const parts: string[] = [];
   for (const t of TABLES) {
-    const cols = [...t.intCols.map((c) => `${c} INTEGER`), ...t.textCols.map((c) => `${c} TEXT`)];
+    const cols = ["id INTEGER PRIMARY KEY", ...t.intCols.map((c) => `${c} INTEGER`), ...t.textCols.map((c) => `${c} TEXT`)];
     parts.push(`CREATE TABLE ${t.name} (${cols.join(", ")});`);
     const n = r.int(0, 25);
     for (let i = 0; i < n; i++) {
       const values = [
+        "NULL",
         ...t.intCols.map(() => (r.chance(0.15) ? "NULL" : String(r.int(-3, 8)))),
         ...t.textCols.map(() => (r.chance(0.15) ? "NULL" : `'${r.pick(WORDS)}'`)),
       ];
@@ -276,6 +277,87 @@ function aliased(exprs: string[]): string {
   return exprs.map((e, i) => `${e} AS r${i}`).join(", ");
 }
 
+/** Window function queries, ordered with unique tiebreakers so results are deterministic. */
+function randomWindowQuery(r: Random): string {
+  const t = r.pick(TABLES);
+  let from = `${t.name} x`;
+  let { ints, texts } = columnsOf(t, "x");
+  let ids = ["x.id"];
+  if (r.chance(0.3)) {
+    const t2 = r.pick(TABLES);
+    const cols = columnsOf(t2, "y");
+    from += ` ${r.pick(["JOIN", "LEFT JOIN"])} ${t2.name} y ON ${r.pick(ints)} = ${r.pick(cols.ints)}`;
+    ints = [...ints, ...cols.ints];
+    texts = [...texts, ...cols.texts];
+    ids = ["x.id", "y.id"];
+  }
+  const ctx: Ctx = { r, ints, texts, depth: 1 };
+  const where = r.chance(0.5) ? ` WHERE ${predicate(ctx)}` : "";
+
+  if (r.chance(0.2)) {
+    // Windows over grouped rows: order by aggregates, which are deterministic.
+    const g = r.pick(ints);
+    const agg = `${r.pick(["SUM", "COUNT", "MAX"])}(${r.pick(ints)})`;
+    const fn = r.pick(["RANK()", "DENSE_RANK()", "CUME_DIST()", `SUM(${agg})`, "COUNT(*)"]);
+    return `SELECT ${aliased([g, agg, `${fn} OVER (ORDER BY ${agg}${r.chance(0.5) ? " DESC" : ""})`])} FROM ${from}${where} GROUP BY ${g}`;
+  }
+
+  const partition = r.chance(0.6) ? `PARTITION BY ${r.pick([...ints, ...texts])} ` : "";
+  const key = r.pick([...ints, ...texts]);
+  const dir = r.chance(0.4) ? " DESC" : "";
+  const nulls = r.chance(0.2) ? r.pick([" NULLS FIRST", " NULLS LAST"]) : "";
+  const peerOrder = `ORDER BY ${key}${dir}${nulls}`;
+  const totalOrder = `${peerOrder}, ${ids.join(", ")}`;
+  const value = intExpr({ ...ctx, depth: 2 });
+
+  const windows = Array.from({ length: r.int(1, 3) }, () => {
+    switch (r.int(0, 7)) {
+      case 0:
+        return `ROW_NUMBER() OVER (${partition}${totalOrder})`;
+      case 1:
+        return `${r.pick(["RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST"])}() OVER (${partition}${peerOrder})`;
+      case 2: {
+        const fn = r.pick(["LAG", "LEAD"]);
+        const args = r.chance(0.5) ? `${value}, ${r.int(1, 3)}${r.chance(0.5) ? `, ${r.int(-9, 9)}` : ""}` : value;
+        return `${fn}(${args}) OVER (${partition}${totalOrder})`;
+      }
+      case 3: {
+        const fn = r.pick(["FIRST_VALUE", "LAST_VALUE", `NTH_VALUE`]);
+        const args = fn === "NTH_VALUE" ? `${value}, ${r.int(1, 3)}` : value;
+        const frame = r.chance(0.5) ? " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" : "";
+        return `${fn}(${args}) OVER (${partition}${totalOrder}${frame})`;
+      }
+      case 4:
+        return `NTILE(${r.int(1, 4)}) OVER (${partition}${totalOrder})`;
+      case 5: {
+        // Aggregates with the default (peer-inclusive) frame or no ordering at all.
+        const fn = r.pick(["SUM", "COUNT", "MIN", "MAX", "TOTAL", "AVG"]);
+        return `${fn}(${value}) OVER (${partition}${r.chance(0.6) ? peerOrder : ""})`;
+      }
+      case 6: {
+        const bound = (): string => r.pick(["UNBOUNDED PRECEDING", "CURRENT ROW", "UNBOUNDED FOLLOWING", `${r.int(0, 2)} PRECEDING`, `${r.int(0, 2)} FOLLOWING`]);
+        let start = bound();
+        let end = bound();
+        // Keep frames syntactically valid and with start <= end.
+        const rank = (b: string): number =>
+          b === "UNBOUNDED PRECEDING" ? -100 : b === "UNBOUNDED FOLLOWING" ? 100 : b === "CURRENT ROW" ? 0 : b.endsWith("PRECEDING") ? -Number(b.split(" ")[0]) : Number(b.split(" ")[0]);
+        if (rank(start) > rank(end)) [start, end] = [end, start];
+        if (start === "UNBOUNDED FOLLOWING") start = "CURRENT ROW";
+        if (end === "UNBOUNDED PRECEDING") end = "CURRENT ROW";
+        const fn = r.pick(["SUM", "COUNT", "MIN", "MAX", "TOTAL"]);
+        return `${fn}(${value}) OVER (${partition}${totalOrder} ROWS BETWEEN ${start} AND ${end})`;
+      }
+      default: {
+        // RANGE with numeric offsets needs a single numeric ORDER BY key.
+        const numKey = r.pick(ints);
+        const fn = r.pick(["SUM", "COUNT", "MAX"]);
+        return `${fn}(${value}) OVER (${partition}ORDER BY ${numKey}${dir} RANGE BETWEEN ${r.int(0, 2)} PRECEDING AND ${r.chance(0.5) ? "CURRENT ROW" : `${r.int(0, 2)} FOLLOWING`})`;
+      }
+    }
+  });
+  return `SELECT ${aliased([r.pick(ints), ...windows])} FROM ${from}${where}`;
+}
+
 function normalize(v: unknown): unknown {
   if (typeof v === "boolean") return v ? 1 : 0;
   if (typeof v === "bigint") return Number(v);
@@ -305,7 +387,7 @@ describe.skipIf(!DatabaseSync)("differential testing against SQLite", () => {
       const r = new Random(seed * 1000 + 17);
       let compared = 0;
       for (let i = 0; i < 300; i++) {
-        const sql = randomQuery(r);
+        const sql = i % 5 === 4 ? randomWindowQuery(r) : randomQuery(r);
         let expected: unknown[][];
         try {
           const result = sqlite.prepare(sql).all();
@@ -314,7 +396,9 @@ describe.skipIf(!DatabaseSync)("differential testing against SQLite", () => {
           // The generator occasionally produces queries SQLite rejects; skip them.
           continue;
         }
-        const ordered = /ORDER BY/.test(sql);
+        // Only an outer ORDER BY (always paired with LIMIT here) fixes the row order;
+        // ORDER BY inside OVER (...) does not.
+        const ordered = /\bLIMIT\b/.test(sql);
         const exp = canonical(expected, ordered);
         for (const [label, db] of [
           ["indexed", indexed],
@@ -353,6 +437,7 @@ function randomDml(r: Random): string {
       const n = r.int(1, 3);
       const rowsSql = Array.from({ length: n }, () => {
         const values = [
+          r.chance(0.8) ? "NULL" : String(r.int(100, 120)),
           ...t.intCols.map(() => (r.chance(0.15) ? "NULL" : String(r.int(-3, 8)))),
           ...t.textCols.map(() => (r.chance(0.15) ? "NULL" : `'${r.pick(WORDS)}'`)),
         ];
@@ -362,7 +447,8 @@ function randomDml(r: Random): string {
     }
     case 1: {
       const o = r.pick(others);
-      return `INSERT INTO ${t.name} SELECT ${[...o.intCols, ...o.textCols].join(", ")} FROM ${o.name}${r.chance(0.7) ? ` WHERE ${o.intCols[0]} = ${r.int(-2, 6)}` : ""}`;
+      // ORDER BY pins the order in which new primary keys are handed out.
+      return `INSERT INTO ${t.name} SELECT NULL, ${[...o.intCols, ...o.textCols].join(", ")} FROM ${o.name}${r.chance(0.7) ? ` WHERE ${o.intCols[0]} = ${r.int(-2, 6)}` : ""} ORDER BY id`;
     }
     case 2: {
       const col = r.pick([...t.intCols, ...t.textCols]);

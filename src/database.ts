@@ -197,7 +197,7 @@ export class Database {
     for (const table of this.orderedTables()) {
       lines.push(createTableSql(table) + ";");
       const cols = table.columns.map((c) => quoteIdent(c.name)).join(", ");
-      for (const row of table.rows.values()) {
+      for (const row of table.scan()) {
         lines.push(`INSERT INTO ${quoteIdent(table.name)} (${cols}) VALUES (${row.map(toSqlLiteral).join(", ")});`);
       }
     }
@@ -214,7 +214,7 @@ export class Database {
       version: 1,
       tables: this.orderedTables().map((t) => ({
         schema: createTableSql(t),
-        rows: [...t.rows.values()].map((r) => [...r]),
+        rows: [...t.scan()].map((r) => [...r]),
         autoIncrementSeq: t.autoIncrementSeq,
       })),
       indexes: this.catalog
@@ -235,9 +235,8 @@ export class Database {
       const table = db.catalog.getTable(stmt.name);
       for (const row of t.rows) {
         if (row.length !== table.columns.length) throw new SqlError(`Corrupt snapshot: bad row width in ${table.name}`);
-        table.rows.set(table.nextRowId++, [...row]);
+        table.load([...row]);
       }
-      for (const index of table.indexes) table.populateIndex(index);
       table.autoIncrementSeq = t.autoIncrementSeq;
     }
     for (const sql of snapshot.indexes) db.exec(sql);
@@ -735,10 +734,14 @@ export class Database {
       if (autoCol >= 0) {
         const v = row[autoCol];
         if (v === null) {
-          table.autoIncrementSeq = Math.max(table.autoIncrementSeq, maxIntegerIn(table, autoCol)) + 1;
-          row[autoCol] = table.autoIncrementSeq;
-        } else if (typeof v === "number" && Number.isInteger(v)) {
-          table.autoIncrementSeq = Math.max(table.autoIncrementSeq, v);
+          // Like SQLite: AUTOINCREMENT never reuses a value; a plain INTEGER
+          // PRIMARY KEY takes one more than the current maximum.
+          const max = maxIntegerIn(table, autoCol);
+          row[autoCol] = table.columns[autoCol]!.autoIncrement ? Math.max(table.autoIncrementSeq, max) + 1 : max + 1;
+        }
+        const assigned = row[autoCol];
+        if (typeof assigned === "number" && Number.isInteger(assigned) && table.columns[autoCol]!.autoIncrement) {
+          table.autoIncrementSeq = Math.max(table.autoIncrementSeq, assigned);
         }
       }
       const finalRow = validate(row as SqlValue[]);

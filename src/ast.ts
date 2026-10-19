@@ -131,6 +131,27 @@ export interface FunctionCallExpr {
   distinct: boolean;
   /** True for `COUNT(*)`. */
   star: boolean;
+  /** Present for window function calls: `f(...) OVER (...)`. */
+  over?: WindowSpec;
+}
+
+export type FrameBound =
+  | { kind: "unboundedPreceding" }
+  | { kind: "preceding"; offset: Expr }
+  | { kind: "currentRow" }
+  | { kind: "following"; offset: Expr }
+  | { kind: "unboundedFollowing" };
+
+export interface WindowFrame {
+  unit: "ROWS" | "RANGE";
+  start: FrameBound;
+  end: FrameBound;
+}
+
+export interface WindowSpec {
+  partitionBy: Expr[];
+  orderBy: OrderByItem[];
+  frame?: WindowFrame;
 }
 
 export interface SubqueryExpr {

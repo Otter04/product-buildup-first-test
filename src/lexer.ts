@@ -104,6 +104,15 @@ export const KEYWORDS = new Set([
   "SHOW",
   "TABLES",
   "DESCRIBE",
+  "OVER",
+  "PARTITION",
+  "ROWS",
+  "RANGE",
+  "UNBOUNDED",
+  "PRECEDING",
+  "FOLLOWING",
+  "CURRENT",
+  "ROW",
 ]);
 
 const TWO_CHAR_OPERATORS = new Set(["<=", ">=", "<>", "!=", "||", "=="]);

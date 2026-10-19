@@ -1,7 +1,8 @@
-import type { Expr, FunctionCallExpr, SelectStatement } from "./ast.js";
+import type { Expr, FrameBound, FunctionCallExpr, SelectStatement, WindowSpec } from "./ast.js";
 import { SqlCatalogError, SqlRuntimeError } from "./errors.js";
 import { isAggregateCall, like, lookupScalar } from "./functions.js";
 import { castValue, sqlCompare, toBool, toNumber, toText, type SqlValue } from "./values.js";
+import { WINDOW_ONLY_FUNCTIONS } from "./window.js";
 
 /** One column visible to expressions at some query level. */
 export interface ColumnInfo {
@@ -33,6 +34,8 @@ export class Scope {
     readonly boundary?: Boundary,
     /** For post-aggregation scopes: aggregate call → column index of its result. */
     readonly aggregates?: Map<FunctionCallExpr, number>,
+    /** For projection scopes: window function call → column index of its result. */
+    readonly windows?: Map<FunctionCallExpr, number>,
   ) {}
 
   /** Finds a column at this level only. Throws on ambiguity. */
@@ -138,6 +141,10 @@ export function walkExpr(expr: Expr, visit: (e: Expr) => boolean | void): void {
       break;
     case "function":
       for (const a of expr.args) walkExpr(a, visit);
+      if (expr.over) {
+        for (const p of expr.over.partitionBy) walkExpr(p, visit);
+        for (const o of expr.over.orderBy) walkExpr(o.expr, visit);
+      }
       break;
     default:
       break;
@@ -154,13 +161,33 @@ export function containsSubquery(expr: Expr): boolean {
   return found;
 }
 
+/** True for calls that aggregate a whole group (aggregate functions without OVER). */
+export function isGroupAggregate(e: Expr): e is FunctionCallExpr {
+  return e.kind === "function" && !e.over && isAggregateCall(e.name, e.args.length, e.star);
+}
+
+/** Collects the window function calls of an expression. */
+export function collectWindows(expr: Expr, out: FunctionCallExpr[]): void {
+  walkExpr(expr, (e) => {
+    if (e.kind === "function" && e.over) {
+      for (const a of e.args) {
+        walkExpr(a, (inner) => {
+          if (inner.kind === "function" && inner.over) throw new SqlRuntimeError("Window functions cannot be nested");
+        });
+      }
+      out.push(e);
+    }
+    return true;
+  });
+}
+
 /** Collects the aggregate calls of an expression in evaluation order. */
 export function collectAggregates(expr: Expr, out: FunctionCallExpr[]): void {
   walkExpr(expr, (e) => {
-    if (e.kind === "function" && isAggregateCall(e.name, e.args.length, e.star)) {
+    if (isGroupAggregate(e)) {
       for (const arg of e.args) {
         walkExpr(arg, (inner) => {
-          if (inner.kind === "function" && isAggregateCall(inner.name, inner.args.length, inner.star)) {
+          if (isGroupAggregate(inner)) {
             throw new SqlRuntimeError(`Aggregate functions cannot be nested: ${e.name}(${inner.name}(...))`);
           }
         });
@@ -465,6 +492,12 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
     }
 
     case "function": {
+      if (expr.over) {
+        const slot = scope.windows?.get(expr);
+        if (slot === undefined) throw new SqlRuntimeError(`Window function ${expr.name}() is only allowed in the select list and ORDER BY`);
+        return (env) => env.row[slot]!;
+      }
+      if (WINDOW_ONLY_FUNCTIONS[expr.name]) throw new SqlRuntimeError(`${expr.name}() requires an OVER clause`);
       if (isAggregateCall(expr.name, expr.args.length, expr.star)) {
         const slot = scope.aggregates?.get(expr);
         if (slot === undefined) {
@@ -566,10 +599,34 @@ export function exprToSql(expr: Expr): string {
     }
     case "cast":
       return `CAST(${exprToSql(expr.operand)} AS ${expr.type})`;
-    case "function":
-      if (expr.star) return `${expr.name}(*)`;
-      return `${expr.name}(${expr.distinct ? "DISTINCT " : ""}${expr.args.map(exprToSql).join(", ")})`;
+    case "function": {
+      const call = expr.star ? `${expr.name}(*)` : `${expr.name}(${expr.distinct ? "DISTINCT " : ""}${expr.args.map(exprToSql).join(", ")})`;
+      return expr.over ? `${call} OVER (${windowToSql(expr.over)})` : call;
+    }
   }
+}
+
+function frameBoundToSql(b: FrameBound): string {
+  switch (b.kind) {
+    case "unboundedPreceding":
+      return "UNBOUNDED PRECEDING";
+    case "unboundedFollowing":
+      return "UNBOUNDED FOLLOWING";
+    case "currentRow":
+      return "CURRENT ROW";
+    case "preceding":
+      return `${exprToSql(b.offset)} PRECEDING`;
+    case "following":
+      return `${exprToSql(b.offset)} FOLLOWING`;
+  }
+}
+
+function windowToSql(spec: WindowSpec): string {
+  const parts: string[] = [];
+  if (spec.partitionBy.length) parts.push(`PARTITION BY ${spec.partitionBy.map(exprToSql).join(", ")}`);
+  if (spec.orderBy.length) parts.push(`ORDER BY ${spec.orderBy.map((o) => `${exprToSql(o.expr)} ${o.direction}`).join(", ")}`);
+  if (spec.frame) parts.push(`${spec.frame.unit} BETWEEN ${frameBoundToSql(spec.frame.start)} AND ${frameBoundToSql(spec.frame.end)}`);
+  return parts.join(" ");
 }
 
 function wrap(expr: Expr): string {
