@@ -120,6 +120,9 @@ export const KEYWORDS = new Set([
   "RETURNING",
   "ESCAPE",
   "GLOB",
+  "IGNORE",
+  "REPLACE",
+  "WINDOW",
 ]);
 
 const TWO_CHAR_OPERATORS = new Set(["<=", ">=", "<>", "!=", "||", "=="]);

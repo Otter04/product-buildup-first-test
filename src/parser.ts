@@ -20,6 +20,7 @@ import type {
   FunctionCallExpr,
   InsertStatement,
   JoinType,
+  NamedWindow,
   OnConflict,
   OrderByItem,
   SelectCore,
@@ -39,6 +40,9 @@ import { tokenize, type Token, type TokenType } from "./lexer.js";
  */
 const SOFT_KEYWORDS = new Set([
   "ADD",
+  "IGNORE",
+  "REPLACE",
+  "WINDOW",
   "CONFLICT",
   "DO",
   "ESCAPE",
@@ -267,6 +271,9 @@ export class Parser {
           return this.parseSelect();
         case "INSERT":
           return this.parseInsert();
+        case "REPLACE":
+          if (this.isKeyword("INTO", 1)) return this.parseInsert();
+          break;
         case "UPDATE":
           return this.parseUpdate();
         case "DELETE":
@@ -496,7 +503,18 @@ export class Parser {
   }
 
   private parseInsert(): InsertStatement {
-    this.expectKeyword("INSERT", "INTO");
+    let orAction: InsertStatement["orAction"];
+    if (this.matchKeyword("REPLACE")) {
+      orAction = "REPLACE";
+    } else {
+      this.expectKeyword("INSERT");
+      if (this.matchKeyword("OR")) {
+        const tok = this.next();
+        if (tok.type === "keyword" && (tok.value === "IGNORE" || tok.value === "REPLACE")) orAction = tok.value;
+        else if (!(tok.type === "identifier" && /^(ABORT|FAIL)$/i.test(tok.value))) this.fail("Expected IGNORE, REPLACE, ABORT or FAIL after INSERT OR", tok);
+      }
+    }
+    this.expectKeyword("INTO");
     const table = this.parseIdentifier("table name");
     let columns: string[] | undefined;
     if (this.isPunct("(") && !this.isKeyword("SELECT", 1) && !this.isKeyword("WITH", 1)) {
@@ -523,7 +541,11 @@ export class Parser {
     } else {
       return this.fail(`Expected VALUES or SELECT but found ${this.describe(this.peek())}`);
     }
-    if (this.matchKeyword("ON", "CONFLICT")) stmt.onConflict = this.parseOnConflict();
+    if (this.matchKeyword("ON", "CONFLICT")) {
+      if (orAction) this.fail(`INSERT OR ${orAction} cannot be combined with ON CONFLICT`);
+      stmt.onConflict = this.parseOnConflict();
+    }
+    if (orAction) stmt.orAction = orAction;
     stmt.returning = this.parseReturning();
     return stmt;
   }
@@ -690,7 +712,50 @@ export class Parser {
       while (this.matchPunct(","));
     }
     const having = this.matchKeyword("HAVING") ? this.parseExpr() : undefined;
-    return { distinct, columns, from, where, groupBy, having };
+    const core: SelectCore = { distinct, columns, from, where, groupBy, having };
+    const windows: NamedWindow[] = [];
+    if (this.matchKeyword("WINDOW")) {
+      do {
+        const name = this.parseIdentifier("window name");
+        this.expectKeyword("AS");
+        windows.push({ name, spec: this.parseWindowSpec() });
+      } while (this.matchPunct(","));
+    }
+    this.resolveNamedWindows(core, windows);
+    return core;
+  }
+
+  /** Replaces `OVER name` references in a SELECT core with the named windows' definitions. */
+  private resolveNamedWindows(core: SelectCore, windows: NamedWindow[]): void {
+    const byName = new Map<string, WindowSpec>();
+    const resolve = (spec: WindowSpec): WindowSpec => {
+      if (!spec.base) return spec;
+      const base = byName.get(spec.base.toLowerCase());
+      if (!base) throw new SqlSyntaxError(`No such window: ${spec.base}`, this.peek().line, this.peek().column);
+      if (spec.partitionBy.length) throw new SqlSyntaxError(`Cannot override PARTITION BY of window ${spec.base}`, this.peek().line, this.peek().column);
+      if (spec.orderBy.length && base.orderBy.length) {
+        throw new SqlSyntaxError(`Cannot override ORDER BY of window ${spec.base}`, this.peek().line, this.peek().column);
+      }
+      if (base.frame) throw new SqlSyntaxError(`Cannot build on window ${spec.base}, which has a frame`, this.peek().line, this.peek().column);
+      return {
+        partitionBy: base.partitionBy,
+        orderBy: spec.orderBy.length ? spec.orderBy : base.orderBy,
+        frame: spec.frame,
+      };
+    };
+    for (const w of windows) {
+      const key = w.name.toLowerCase();
+      if (byName.has(key)) throw new SqlSyntaxError(`Window ${w.name} is defined more than once`, this.peek().line, this.peek().column);
+      byName.set(key, resolve(w.spec));
+    }
+    const visit = (expr: Expr | undefined): void => {
+      if (!expr) return;
+      walkAll(expr, (e) => {
+        if (e.kind === "function" && e.over?.base) e.over = resolve(e.over);
+      });
+    };
+    for (const item of core.columns) visit(item.expr);
+    visit(core.having);
   }
 
   /** `VALUES (1, 2), (3, 4)` as a standalone query, with columns column1, column2, ... */
@@ -860,6 +925,12 @@ export class Parser {
       }
       if (this.matchKeyword("IS")) {
         const negated = this.matchKeyword("NOT");
+        if (this.matchKeyword("DISTINCT")) {
+          // `a IS DISTINCT FROM b` is the null-safe inequality.
+          this.expectKeyword("FROM");
+          left = nullSafeEquals(left, this.parseAdditive(), !negated);
+          continue;
+        }
         if (this.matchKeyword("NULL")) {
           left = { kind: "isNull", operand: left, negated };
         } else if (this.matchKeyword("TRUE") || this.matchKeyword("FALSE")) {
@@ -1059,10 +1130,7 @@ export class Parser {
       this.next();
       this.expectPunct(")");
       const call: FunctionCallExpr = { kind: "function", name, args: [], distinct: false, star: true };
-      if (this.isKeyword("OVER") && this.isPunct("(", 1)) {
-        this.next();
-        call.over = this.parseWindowSpec();
-      }
+      this.parseOver(call);
       return call;
     }
     const distinct = this.matchKeyword("DISTINCT");
@@ -1073,16 +1141,29 @@ export class Parser {
     }
     this.expectPunct(")");
     const call: FunctionCallExpr = { kind: "function", name, args, distinct, star: false };
-    if (this.isKeyword("OVER") && this.isPunct("(", 1)) {
+    this.parseOver(call);
+    return call;
+  }
+
+  /** Parses an optional `OVER (...)` or `OVER name` after a function call. */
+  private parseOver(call: FunctionCallExpr): void {
+    if (!this.isKeyword("OVER")) return;
+    if (this.isPunct("(", 1)) {
       this.next();
       call.over = this.parseWindowSpec();
+    } else if (this.isIdentifier(1)) {
+      this.next();
+      call.over = { base: this.parseIdentifier("window name"), partitionBy: [], orderBy: [] };
     }
-    return call;
   }
 
   private parseWindowSpec(): WindowSpec {
     this.expectPunct("(");
     const spec: WindowSpec = { partitionBy: [], orderBy: [] };
+    // `(w ORDER BY ...)`: a window based on a named one.
+    if (this.isIdentifier() && !this.isKeyword("PARTITION") && !this.isKeyword("ORDER") && !this.isKeyword("ROWS") && !this.isKeyword("RANGE")) {
+      spec.base = this.parseIdentifier("window name");
+    }
     if (this.matchKeyword("PARTITION")) {
       this.expectKeyword("BY");
       do spec.partitionBy.push(this.parseExpr());
@@ -1142,6 +1223,44 @@ export class Parser {
     this.expectKeyword("END");
     return { kind: "case", operand, branches, elseExpr };
   }
+}
+
+/** Visits an expression tree including window specifications (but not subqueries). */
+function walkAll(expr: Expr, visit: (e: Expr) => void): void {
+  visit(expr);
+  const children: Expr[] = [];
+  switch (expr.kind) {
+    case "unary":
+    case "isNull":
+    case "cast":
+      children.push(expr.operand);
+      break;
+    case "binary":
+      children.push(expr.left, expr.right);
+      break;
+    case "between":
+      children.push(expr.operand, expr.low, expr.high);
+      break;
+    case "inList":
+      children.push(expr.operand, ...expr.list);
+      break;
+    case "inSubquery":
+      children.push(expr.operand);
+      break;
+    case "like":
+      children.push(expr.operand, expr.pattern, ...(expr.escape ? [expr.escape] : []));
+      break;
+    case "case":
+      if (expr.operand) children.push(expr.operand);
+      for (const b of expr.branches) children.push(b.when, b.then);
+      if (expr.elseExpr) children.push(expr.elseExpr);
+      break;
+    case "function":
+      children.push(...expr.args);
+      if (expr.over) children.push(...expr.over.partitionBy, ...expr.over.orderBy.map((o) => o.expr));
+      break;
+  }
+  for (const c of children) walkAll(c, visit);
 }
 
 function rightmostName(item: FromItem): string | undefined {

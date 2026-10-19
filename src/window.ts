@@ -20,6 +20,7 @@ export const WINDOW_ONLY_FUNCTIONS: Record<string, { minArgs: number; maxArgs: n
 };
 
 export function validateWindowCall(call: FunctionCallExpr): void {
+  if (call.over?.base) throw new SqlCatalogError(`No such window: ${call.over.base}`);
   const only = WINDOW_ONLY_FUNCTIONS[call.name];
   if (only) {
     if (call.args.length < only.minArgs || call.args.length > only.maxArgs) {

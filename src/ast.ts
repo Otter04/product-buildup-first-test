@@ -138,6 +138,12 @@ export interface FunctionCallExpr {
   over?: WindowSpec;
 }
 
+/** A named window from a `WINDOW name AS (...)` clause. */
+export interface NamedWindow {
+  name: string;
+  spec: WindowSpec;
+}
+
 export type FrameBound =
   | { kind: "unboundedPreceding" }
   | { kind: "preceding"; offset: Expr }
@@ -152,6 +158,8 @@ export interface WindowFrame {
 }
 
 export interface WindowSpec {
+  /** `OVER w` or `OVER (w ORDER BY ...)`: the named window this one builds on (resolved by the parser). */
+  base?: string;
   partitionBy: Expr[];
   orderBy: OrderByItem[];
   frame?: WindowFrame;
@@ -249,6 +257,8 @@ export interface OnConflict {
 
 export interface InsertStatement {
   type: "insert";
+  /** `INSERT OR IGNORE` / `INSERT OR REPLACE` (and `REPLACE INTO`). */
+  orAction?: "IGNORE" | "REPLACE";
   table: string;
   columns?: string[];
   /** Either literal rows (`VALUES`) or a query (`INSERT ... SELECT`). */

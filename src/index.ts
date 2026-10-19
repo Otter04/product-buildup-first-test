@@ -1,6 +1,7 @@
 export { Database, PreparedStatement, toObjects } from "./database.js";
 export type { DatabaseSnapshot, Params, QueryResult, RunResult } from "./database.js";
 export { SqlCatalogError, SqlConstraintError, SqlError, SqlRuntimeError, SqlSyntaxError } from "./errors.js";
+export type { ConstraintKind } from "./errors.js";
 export { parse, parseExpression, Parser } from "./parser.js";
 export { tokenize } from "./lexer.js";
 export type { Token, TokenType } from "./lexer.js";

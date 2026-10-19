@@ -234,9 +234,10 @@ export class Table {
       if (!index.unique) continue;
       if (index.findConflict(row, exceptRowId) !== undefined) {
         const values = index.columnIndexes.map((i) => formatValue(row[i]!)).join(", ");
-        const what = index.name.startsWith("pk_") ? "PRIMARY KEY" : "UNIQUE";
+        const isPk = index.name.startsWith("pk_") && index.implicit;
         throw new SqlConstraintError(
-          `${what} constraint failed: ${this.name}(${index.columns.join(", ")}) already contains (${values})`,
+          `${isPk ? "PRIMARY KEY" : "UNIQUE"} constraint failed: ${this.name}(${index.columns.join(", ")}) already contains (${values})`,
+          isPk ? "primaryKey" : "unique",
         );
       }
     }

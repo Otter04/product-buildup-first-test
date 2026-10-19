@@ -69,6 +69,24 @@ export interface DatabaseSnapshot {
 
 const STATEMENT_CACHE_SIZE = 128;
 
+/** Everything an INSERT needs at execution time, prepared once per plan. */
+interface InsertPlan {
+  table: Table;
+  targetIdx: number[];
+  defaults: (Expr | undefined)[];
+  autoCol: number;
+  validate: (row: SqlValue[]) => SqlValue[];
+  referenced: boolean;
+  upsert: ReturnType<Database["compileUpsert"]>;
+  returning: ReturnType<Database["compileReturning"]>;
+  orAction?: "IGNORE" | "REPLACE";
+}
+
+/** Constraint failures that `INSERT OR IGNORE` skips (foreign keys still fail, as in SQLite). */
+function isIgnorable(e: unknown): boolean {
+  return e instanceof SqlConstraintError && (e.kind === "notNull" || e.kind === "check" || e.kind === "unique" || e.kind === "primaryKey");
+}
+
 /** Converts a result's rows into objects keyed by column name. */
 export function toObjects(result: Pick<QueryResult, "columns" | "rows">): Row[] {
   return result.rows.map((r) => {
@@ -791,12 +809,12 @@ export class Database {
         const col = table.columns[i]!;
         const value = coerceToType(v, col.type, col.name);
         if (value === null && col.notNull) {
-          throw new SqlConstraintError(`NOT NULL constraint failed: ${table.name}.${col.name}`);
+          throw new SqlConstraintError(`NOT NULL constraint failed: ${table.name}.${col.name}`, "notNull");
         }
         return value;
       });
       for (const c of checks) {
-        if (!c.check({ row: out })) throw new SqlConstraintError(`CHECK constraint failed: ${table.name}.${c.column} (${exprToSql(c.expr)})`);
+        if (!c.check({ row: out })) throw new SqlConstraintError(`CHECK constraint failed: ${table.name}.${c.column} (${exprToSql(c.expr)})`, "check");
       }
       for (const ref of references) {
         const v = out[ref.column]!;
@@ -805,6 +823,7 @@ export class Database {
         if (!findRow(ref.parent, ref.parentCol, v)) {
           throw new SqlConstraintError(
             `FOREIGN KEY constraint failed: ${table.name}.${table.columns[ref.column]!.name} = ${formatValue(v)} has no match in ${ref.parent.name}.${ref.parent.columns[ref.parentCol]!.name}`,
+            "foreignKey",
           );
         }
       }
@@ -828,6 +847,7 @@ export class Database {
         if (hit && !(child === table && hit === oldRow)) {
           throw new SqlConstraintError(
             `FOREIGN KEY constraint failed: ${table.name}.${table.columns[parentCol]!.name} = ${formatValue(oldValue)} is still referenced by ${child.name}.${c.name}`,
+            "foreignKey",
           );
         }
       });
@@ -901,21 +921,15 @@ export class Database {
     return (params) => {
       box.values = params;
       compiler.beginRun();
-      return this.executeInsert(table, targetIdx, sourceRows(), defaults, autoCol, validate, referenced, upsert, returning);
+      return this.executeInsert(
+        { table, targetIdx, defaults, autoCol, validate, referenced, upsert, returning, orAction: stmt.orAction },
+        sourceRows(),
+      );
     };
   }
 
-  private executeInsert(
-    table: Table,
-    targetIdx: number[],
-    sourceRows: SqlValue[][],
-    defaults: (Expr | undefined)[],
-    autoCol: number,
-    validate: (row: SqlValue[]) => SqlValue[],
-    referenced: boolean,
-    upsert: ReturnType<Database["compileUpsert"]>,
-    returning: ReturnType<Database["compileReturning"]>,
-  ): QueryResult {
+  private executeInsert(plan: InsertPlan, sourceRows: SqlValue[][]): QueryResult {
+    const { table, targetIdx, defaults, autoCol, validate, referenced, upsert, returning, orAction } = plan;
     const returned: SqlValue[][] = [];
     let lastInsertRowId: number | undefined;
     let changes = 0;
@@ -939,7 +953,32 @@ export class Database {
         const max = maxIntegerIn(table, autoCol);
         row[autoCol] = table.columns[autoCol]!.autoIncrement ? Math.max(table.autoIncrementSeq, max) + 1 : max + 1;
       }
-      const finalRow = validate(row as SqlValue[]);
+      if (orAction === "REPLACE") {
+        // REPLACE substitutes the default for a NULL in a NOT NULL column, like SQLite.
+        table.columns.forEach((c, i) => {
+          if (row[i] === null && c.notNull && defaults[i]) row[i] = this.evaluateDefault(defaults[i]!);
+        });
+      }
+      let finalRow: SqlValue[];
+      try {
+        finalRow = validate(row as SqlValue[]);
+      } catch (e) {
+        if (orAction === "IGNORE" && isIgnorable(e)) continue;
+        throw e;
+      }
+
+      if (orAction === "IGNORE" && table.indexes.some((ix) => ix.unique && ix.findConflict(finalRow) !== undefined)) continue;
+      if (orAction === "REPLACE") {
+        // Remove every row the new one would collide with, then insert.
+        for (const ix of table.indexes) {
+          if (!ix.unique) continue;
+          const hit = ix.findConflict(finalRow);
+          if (hit === undefined) continue;
+          const old = table.rows.get(hit)!;
+          table.delete(hit, this.journal);
+          if (referenced) this.checkNotReferenced(table, old);
+        }
+      }
 
       if (upsert) {
         const conflictId = upsert.findConflict(finalRow);

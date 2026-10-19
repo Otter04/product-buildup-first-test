@@ -141,7 +141,11 @@ function predicate(ctx: Ctx): string {
   if (roll < 0.5) return `${intExpr(inner)} ${r.pick(["=", "<>", "<", "<=", ">", ">="])} ${intExpr(inner)}`;
   if (roll < 0.6) return `${textExpr(inner)} ${r.pick(["=", "<>", "<", ">="])} ${textExpr(inner)}`;
   if (roll < 0.65) return `${r.pick([...ctx.ints, ...ctx.texts])} IS ${r.chance(0.5) ? "NOT " : ""}NULL`;
-  if (roll < 0.68 && ctx.ints.length) return `${r.pick(ctx.ints)} IS ${r.chance(0.5) ? "NOT " : ""}${r.chance(0.5) ? r.pick(ctx.ints) : r.int(-1, 4)}`;
+  if (roll < 0.68 && ctx.ints.length) {
+    const other = r.chance(0.5) ? r.pick(ctx.ints) : String(r.int(-1, 4));
+    const op = r.pick(["IS", "IS NOT", "IS DISTINCT FROM", "IS NOT DISTINCT FROM"]);
+    return `${r.pick(ctx.ints)} ${op} ${other}`;
+  }
   if (roll < 0.76) {
     const list = Array.from({ length: r.int(1, 4) }, () => (r.chance(0.1) ? "NULL" : String(r.int(-2, 6))));
     return `${intExpr(inner)} ${r.chance(0.3) ? "NOT " : ""}IN (${list.join(", ")})`;
@@ -360,6 +364,12 @@ function randomWindowQuery(r: Random): string {
       }
     }
   });
+  if (r.chance(0.25)) {
+    // Move the shared partition/order into a named window.
+    const spec = `${partition}${totalOrder}`;
+    const named = windows.map((w) => w.replace(`OVER (${spec})`, "OVER w"));
+    return `SELECT ${aliased([r.pick(ints), ...named])} FROM ${from}${where} WINDOW w AS (${spec})`;
+  }
   return `SELECT ${aliased([r.pick(ints), ...windows])} FROM ${from}${where}`;
 }
 
@@ -442,7 +452,20 @@ function randomDml(r: Random): string {
     const items = r.chance(0.3) ? ["*"] : Array.from({ length: r.int(1, 2) }, () => (r.chance(0.6) ? intExpr(ctx) : textExpr(ctx)));
     return ` RETURNING ${items.map((e, i) => (e === "*" ? e : `${e} AS r${i}`)).join(", ")}`;
   };
-  switch (r.int(0, 4)) {
+  switch (r.int(0, 5)) {
+    case 5: {
+      // INSERT OR IGNORE / OR REPLACE / REPLACE INTO with ids likely to collide.
+      const verb = r.pick(["INSERT OR IGNORE", "INSERT OR REPLACE", "REPLACE"]);
+      const rowsSql = Array.from({ length: r.int(1, 3) }, () => {
+        const values = [
+          String(r.int(1, 25)),
+          ...t.intCols.map(() => (r.chance(0.15) ? "NULL" : String(r.int(-3, 8)))),
+          ...t.textCols.map(() => (r.chance(0.15) ? "NULL" : `'${r.pick(WORDS)}'`)),
+        ];
+        return `(${values.join(", ")})`;
+      });
+      return `${verb} INTO ${t.name} VALUES ${rowsSql.join(", ")}${returning()}`;
+    }
     case 4: {
       // Upsert against the primary key with ids likely to collide.
       const values = [
