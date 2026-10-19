@@ -80,9 +80,32 @@ export class Scope {
   }
 }
 
+export type ParamValues = SqlValue[] | Record<string, SqlValue>;
+
+/**
+ * Holds the parameter values of the current execution. Compiled plans read
+ * parameters from it at run time, so a plan can be reused with new values.
+ */
+export class ParamBox {
+  values: ParamValues = [];
+
+  get(key: number | string): SqlValue {
+    const params = this.values;
+    if (typeof key === "number") {
+      if (!Array.isArray(params)) throw new SqlRuntimeError("Positional parameter used but named parameters were supplied");
+      const value = params[key];
+      if (value === undefined) throw new SqlRuntimeError(`Missing value for parameter ${key + 1}`);
+      return value;
+    }
+    if (Array.isArray(params)) throw new SqlRuntimeError(`Named parameter :${key} used but positional parameters were supplied`);
+    if (!(key in params)) throw new SqlRuntimeError(`Missing value for parameter :${key}`);
+    return params[key]!;
+  }
+}
+
 /** Hooks the expression compiler needs from the query compiler. */
 export interface CompileContext {
-  params: SqlValue[] | Record<string, SqlValue>;
+  params: ParamBox;
   /**
    * Compiles a subquery whose scope chain is rooted at `outer`. Returns a
    * function that runs it for a given outer environment.
@@ -261,6 +284,25 @@ function arithmetic(op: string, a: SqlValue, b: SqlValue): SqlValue {
   throw new SqlRuntimeError(`Unknown operator ${op}`);
 }
 
+/** Builds an operator-specific comparison closure (avoids a switch per row). */
+function comparison(op: string, left: Compiled, right: Compiled): Compiled {
+  const test = COMPARATORS[op];
+  if (!test) throw new SqlRuntimeError(`Unknown operator ${op}`);
+  return (env) => {
+    const c = sqlCompare(left(env), right(env));
+    return c === null ? null : test(c);
+  };
+}
+
+const COMPARATORS: Record<string, (c: number) => boolean> = {
+  "=": (c) => c === 0,
+  "<>": (c) => c !== 0,
+  "<": (c) => c < 0,
+  "<=": (c) => c <= 0,
+  ">": (c) => c > 0,
+  ">=": (c) => c >= 0,
+};
+
 function compareOp(op: string, a: SqlValue, b: SqlValue): SqlValue {
   const c = sqlCompare(a, b);
   if (c === null) return null;
@@ -290,19 +332,9 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
     }
 
     case "param": {
-      const { params } = ctx;
-      let value: SqlValue | undefined;
-      if (typeof expr.key === "number") {
-        if (!Array.isArray(params)) throw new SqlRuntimeError("Positional parameter used but named parameters were supplied");
-        value = params[expr.key];
-        if (value === undefined) throw new SqlRuntimeError(`Missing value for parameter ${expr.key + 1}`);
-      } else {
-        if (Array.isArray(params)) throw new SqlRuntimeError(`Named parameter :${expr.key} used but positional parameters were supplied`);
-        if (!(expr.key in params)) throw new SqlRuntimeError(`Missing value for parameter :${expr.key}`);
-        value = params[expr.key];
-      }
-      const v = normalizeParam(value);
-      return () => v;
+      const box = ctx.params;
+      const key = expr.key;
+      return () => box.get(key);
     }
 
     case "column": {
@@ -377,7 +409,7 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
         case "%":
           return (env) => arithmetic(op, left(env), right(env));
         default:
-          return (env) => compareOp(op, left(env), right(env));
+          return comparison(op, left, right);
       }
     }
 

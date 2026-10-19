@@ -26,6 +26,14 @@ export class Journal {
   }
 }
 
+/** Whether two versions of a row have identical keys in `index` (same values and types). */
+function sameIndexKey(index: Index, a: SqlValue[], b: SqlValue[]): boolean {
+  for (const i of index.columnIndexes) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 /** Index key: the indexed column values followed by the row id as a tiebreaker. */
 export type IndexKey = SqlValue[];
 
@@ -191,7 +199,29 @@ export class Table {
 
   /** All rows in scan order. */
   *scan(): Generator<SqlValue[]> {
-    for (const id of this.rowIds()) yield this.rows.get(id)!;
+    for (const chunk of this.scanChunks()) yield* chunk;
+  }
+
+  /**
+   * All rows in scan order, in batches. Full scans iterate batches to keep
+   * per-row overhead low while staying lazy (so LIMIT can stop early).
+   */
+  *scanChunks(): Generator<SqlValue[][]> {
+    const clustered = this.clusteredIndex;
+    if (clustered) {
+      // Copy each leaf's ids first: the caller may modify the table between batches.
+      for (const ids of clustered.tree.valueChunks()) yield ids.map((id) => this.rows.get(id)!);
+      return;
+    }
+    let batch: SqlValue[][] = [];
+    for (const row of this.rows.values()) {
+      batch.push(row);
+      if (batch.length === 256) {
+        yield batch;
+        batch = [];
+      }
+    }
+    if (batch.length) yield batch;
   }
 
   get autoIncrementColumn(): number {
@@ -199,8 +229,8 @@ export class Table {
   }
 
   /** Checks UNIQUE / PRIMARY KEY constraints for a candidate row. */
-  checkUnique(row: SqlValue[], exceptRowId?: number): void {
-    for (const index of this.indexes) {
+  checkUnique(row: SqlValue[], exceptRowId?: number, indexes: Index[] = this.indexes): void {
+    for (const index of indexes) {
       if (!index.unique) continue;
       if (index.findConflict(row, exceptRowId) !== undefined) {
         const values = index.columnIndexes.map((i) => formatValue(row[i]!)).join(", ");
@@ -249,16 +279,18 @@ export class Table {
   update(rowId: number, newRow: SqlValue[], journal: Journal): number {
     const oldRow = this.rows.get(rowId);
     if (!oldRow) throw new Error(`Row ${rowId} not found in ${this.name}`);
-    this.checkUnique(newRow, rowId);
     const clustered = this.clusteredIndex;
     const newId = clustered ? (newRow[clustered.columnIndexes[0]!] as number) : rowId;
-    this.replaceRow(rowId, oldRow, newId, newRow);
-    journal.record(() => this.replaceRow(newId, newRow, rowId, oldRow));
+    // Only indexes whose key changes need checking and maintenance.
+    const affected = newId === rowId ? this.indexes.filter((ix) => !sameIndexKey(ix, oldRow, newRow)) : this.indexes;
+    this.checkUnique(newRow, rowId, affected);
+    this.replaceRow(rowId, oldRow, newId, newRow, affected);
+    journal.record(() => this.replaceRow(newId, newRow, rowId, oldRow, affected));
     return newId;
   }
 
-  private replaceRow(oldId: number, oldRow: SqlValue[], newId: number, newRow: SqlValue[]): void {
-    for (const index of this.indexes) {
+  private replaceRow(oldId: number, oldRow: SqlValue[], newId: number, newRow: SqlValue[], indexes: Index[]): void {
+    for (const index of indexes) {
       index.tree.delete(index.keyFor(oldRow, oldId));
       index.tree.set(index.keyFor(newRow, newId), newId);
     }
@@ -308,6 +340,17 @@ export class Catalog {
   private readonly views = new Map<string, View>();
   private readonly indexes = new Map<string, Index>();
 
+  /**
+   * Schema version, bumped by every schema change (and by undoing one).
+   * Cached query plans are only reused while it is unchanged.
+   */
+  version = 0;
+
+  /** Records a schema change made outside the catalog (e.g. ALTER TABLE). */
+  touch(): void {
+    this.version++;
+  }
+
   getTable(name: string): Table {
     const table = this.tables.get(name.toLowerCase());
     if (!table) {
@@ -329,13 +372,21 @@ export class Catalog {
     const key = view.name.toLowerCase();
     if (this.views.has(key) || this.tables.has(key)) throw new SqlCatalogError(`Table or view '${view.name}' already exists`);
     this.views.set(key, view);
-    journal.record(() => this.views.delete(key));
+    this.touch();
+    journal.record(() => {
+      this.views.delete(key);
+      this.touch();
+    });
   }
 
   removeView(view: View, journal: Journal): void {
     const key = view.name.toLowerCase();
     this.views.delete(key);
-    journal.record(() => this.views.set(key, view));
+    this.touch();
+    journal.record(() => {
+      this.views.set(key, view);
+      this.touch();
+    });
   }
 
   findTable(name: string): Table | undefined {
@@ -355,7 +406,11 @@ export class Catalog {
     if (this.tables.has(key)) throw new SqlCatalogError(`Table '${table.name}' already exists`);
     if (this.views.has(key)) throw new SqlCatalogError(`A view named '${table.name}' already exists`);
     this.tables.set(key, table);
-    journal.record(() => this.tables.delete(key));
+    this.touch();
+    journal.record(() => {
+      this.tables.delete(key);
+      this.touch();
+    });
   }
 
   removeTable(table: Table, journal: Journal): void {
@@ -363,9 +418,11 @@ export class Catalog {
     this.tables.delete(key);
     const removed = table.indexes.map((i) => i.name.toLowerCase());
     for (const name of removed) this.indexes.delete(name);
+    this.touch();
     journal.record(() => {
       this.tables.set(key, table);
       for (const index of table.indexes) this.indexes.set(index.name.toLowerCase(), index);
+      this.touch();
     });
   }
 
@@ -375,10 +432,12 @@ export class Catalog {
     this.tables.delete(oldName.toLowerCase());
     table.name = newName;
     this.tables.set(newName.toLowerCase(), table);
+    this.touch();
     journal.record(() => {
       this.tables.delete(newName.toLowerCase());
       table.name = oldName;
       this.tables.set(oldName.toLowerCase(), table);
+      this.touch();
     });
   }
 
@@ -396,10 +455,12 @@ export class Catalog {
     index.table.populateIndex(index);
     this.indexes.set(key, index);
     index.table.indexes.push(index);
+    this.touch();
     journal.record(() => {
       this.indexes.delete(key);
       const i = index.table.indexes.indexOf(index);
       if (i >= 0) index.table.indexes.splice(i, 1);
+      this.touch();
     });
   }
 
@@ -408,10 +469,12 @@ export class Catalog {
     this.indexes.delete(key);
     const pos = index.table.indexes.indexOf(index);
     if (pos >= 0) index.table.indexes.splice(pos, 1);
+    this.touch();
     journal.record(() => {
       this.indexes.set(key, index);
       index.table.indexes.splice(pos, 0, index);
       index.table.populateIndex(index);
+      this.touch();
     });
   }
 }

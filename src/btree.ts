@@ -282,6 +282,16 @@ export class BPlusTree<K, V> {
     }
   }
 
+  /**
+   * The values of each leaf in ascending key order, one array per leaf. Much
+   * cheaper than {@link entries} for full scans. The arrays must not be modified.
+   */
+  *valueChunks(): Generator<readonly V[]> {
+    for (let leaf: LeafNode<K, V> | null = this.firstLeaf(); leaf; leaf = leaf.next) {
+      if (leaf.values.length) yield leaf.values;
+    }
+  }
+
   *keys(): Generator<K> {
     for (const e of this.entries()) yield e.key;
   }

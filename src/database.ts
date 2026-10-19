@@ -7,15 +7,36 @@ import type {
   Expr,
   InsertStatement,
   SelectItem,
+  SelectStatement,
   Statement,
   UpdateStatement,
 } from "./ast.js";
-import { compileExpr, exprToSql, normalizeParam, quoteIdent, Scope, walkExpr, type ColumnInfo, type Compiled, type Env } from "./compiler.js";
+import {
+  compileExpr,
+  exprToSql,
+  normalizeParam,
+  ParamBox,
+  quoteIdent,
+  Scope,
+  walkExpr,
+  type ColumnInfo,
+  type Compiled,
+  type Env,
+  type ParamValues,
+} from "./compiler.js";
 import { SqlCatalogError, SqlConstraintError, SqlError, SqlRuntimeError } from "./errors.js";
 import { Parser, parseExpression } from "./parser.js";
-import { QueryCompiler, renderPlan } from "./planner.js";
+import { containsParams, QueryCompiler, renderPlan } from "./planner.js";
 import { Catalog, Index, Journal, Table, type View } from "./storage.js";
 import { coerceToType, formatValue, sqlCompare, toBool, toSqlLiteral, type Row, type SqlValue } from "./values.js";
+
+/** Executes a planned statement with the given parameter values. */
+type Executor = (params: ParamValues) => QueryResult;
+
+/** Where a statement's compiled plan is cached, tagged with the schema version it was built for. */
+export interface PlanSlot {
+  plan?: { version: number; execute: Executor };
+}
 
 /** Parameters bound to `?` (array) or `:name` / `$name` / `@name` (object) placeholders. */
 export type Params = readonly unknown[] | Record<string, unknown>;
@@ -46,6 +67,8 @@ export interface DatabaseSnapshot {
   views?: string[];
 }
 
+const STATEMENT_CACHE_SIZE = 128;
+
 /** Converts a result's rows into objects keyed by column name. */
 export function toObjects(result: Pick<QueryResult, "columns" | "rows">): Row[] {
   return result.rows.map((r) => {
@@ -57,7 +80,7 @@ export function toObjects(result: Pick<QueryResult, "columns" | "rows">): Row[] 
   });
 }
 
-function normalizeParams(params: Params | undefined): SqlValue[] | Record<string, SqlValue> {
+function normalizeParams(params: Params | undefined): ParamValues {
   if (params === undefined) return [];
   if (Array.isArray(params)) return params.map(normalizeParam);
   const out: Record<string, SqlValue> = {};
@@ -65,8 +88,13 @@ function normalizeParams(params: Params | undefined): SqlValue[] | Record<string
   return out;
 }
 
-/** A parsed statement that can be executed many times with different parameters. */
+/**
+ * A parsed statement that can be executed many times with different
+ * parameters. Its query plan is compiled once and reused until the schema changes.
+ */
 export class PreparedStatement {
+  private readonly slot: PlanSlot = {};
+
   constructor(
     private readonly db: Database,
     private readonly statements: Statement[],
@@ -77,7 +105,7 @@ export class PreparedStatement {
 
   /** Executes the statement and returns the full result. */
   execute(params?: Params): QueryResult {
-    return this.db.executeStatement(this.statements[0]!, params);
+    return this.db.executeStatement(this.statements[0]!, params, this.slot);
   }
 
   /** Returns every result row as an object. */
@@ -116,6 +144,8 @@ export class Database {
   private readonly catalog = new Catalog();
   private readonly journal = new Journal();
   private transactionDepth = 0;
+  /** Recently executed SQL text → parsed statements with their cached plans (LRU order). */
+  private readonly statementCache = new Map<string, { statement: Statement; slot: PlanSlot }[]>();
 
   /** True while an explicit transaction (BEGIN ... COMMIT) is open. */
   get inTransaction(): boolean {
@@ -126,10 +156,30 @@ export class Database {
   // Public API
   // -------------------------------------------------------------------------
 
-  /** Executes every statement in `sql`, returning one result per statement. */
+  /**
+   * Executes every statement in `sql`, returning one result per statement.
+   * Parsed statements and their plans are cached by SQL text, so repeating
+   * the same SQL with different parameters skips parsing and planning.
+   */
   exec(sql: string, params?: Params): QueryResult[] {
+    const cached = this.statementCache.get(sql);
+    if (cached) {
+      // Refresh the entry's LRU position.
+      this.statementCache.delete(sql);
+      this.statementCache.set(sql, cached);
+      return cached.map((entry) => this.executeStatement(entry.statement, params, entry.slot));
+    }
+    const entries: { statement: Statement; slot: PlanSlot }[] = [];
     const results: QueryResult[] = [];
-    for (const { statement } of new Parser(sql).statements()) results.push(this.executeStatement(statement, params));
+    for (const { statement } of new Parser(sql).statements()) {
+      const entry = { statement, slot: {} };
+      entries.push(entry);
+      results.push(this.executeStatement(statement, params, entry.slot));
+    }
+    this.statementCache.set(sql, entries);
+    if (this.statementCache.size > STATEMENT_CACHE_SIZE) {
+      this.statementCache.delete(this.statementCache.keys().next().value!);
+    }
     return results;
   }
 
@@ -186,7 +236,7 @@ export class Database {
   }
 
   private viewColumns(view: View): string[] {
-    return view.columns ?? new QueryCompiler(this.catalog, []).compileTop(view.query).columns;
+    return view.columns ?? new QueryCompiler(this.catalog, new ParamBox()).compileTop(view.query).columns;
   }
 
   /** Column definitions of a table. */
@@ -263,12 +313,15 @@ export class Database {
   // Statement dispatch
   // -------------------------------------------------------------------------
 
-  /** Executes one parsed statement with statement-level atomicity. */
-  executeStatement(stmt: Statement, params?: Params): QueryResult {
+  /**
+   * Executes one parsed statement with statement-level atomicity. `slot`
+   * holds a cached plan for the statement, reused while the schema is unchanged.
+   */
+  executeStatement(stmt: Statement, params?: Params, slot?: PlanSlot): QueryResult {
     const normalized = normalizeParams(params);
     const mark = this.journal.length;
     try {
-      const result = this.dispatch(stmt, normalized);
+      const result = this.dispatch(stmt, normalized, slot);
       if (!this.inTransaction) this.journal.truncate();
       return result;
     } catch (e) {
@@ -277,19 +330,56 @@ export class Database {
     }
   }
 
-  private dispatch(stmt: Statement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
+  /** Builds (or reuses) the executor for a SELECT / INSERT / UPDATE / DELETE. */
+  private planFor(stmt: SelectStatement | InsertStatement | UpdateStatement | DeleteStatement, slot: PlanSlot | undefined): Executor {
+    const version = this.catalog.version;
+    if (slot?.plan && slot.plan.version === version) return slot.plan.execute;
+    let execute: Executor;
+    switch (stmt.type) {
+      case "select":
+        execute = this.planSelect(stmt);
+        break;
+      case "insert":
+        execute = this.planInsert(stmt);
+        break;
+      case "update":
+        execute = this.planUpdate(stmt);
+        break;
+      case "delete":
+        execute = this.planDelete(stmt);
+        break;
+    }
+    if (slot) slot.plan = { version, execute };
+    return execute;
+  }
+
+  private planSelect(stmt: SelectStatement): Executor {
+    const box = new ParamBox();
+    const compiler = new QueryCompiler(this.catalog, box);
+    const compiled = compiler.compileTop(stmt);
+    return (params) => {
+      box.values = params;
+      compiler.beginRun();
+      return { type: "select", columns: compiled.columns, rows: [...compiled.run()], changes: 0 };
+    };
+  }
+
+  /** Compiles and runs a query once (for statements that are not cached). */
+  private runQuery(query: SelectStatement, params: ParamValues): { columns: string[]; rows: SqlValue[][] } {
+    const box = new ParamBox();
+    box.values = params;
+    const compiled = new QueryCompiler(this.catalog, box).compileTop(query);
+    return { columns: compiled.columns, rows: [...compiled.run()] };
+  }
+
+  private dispatch(stmt: Statement, params: ParamValues, slot?: PlanSlot): QueryResult {
     const empty = (changes = 0): QueryResult => ({ type: stmt.type, columns: [], rows: [], changes });
     switch (stmt.type) {
-      case "select": {
-        const compiled = new QueryCompiler(this.catalog, params).compileTop(stmt);
-        return { type: "select", columns: compiled.columns, rows: [...compiled.run()], changes: 0 };
-      }
+      case "select":
       case "insert":
-        return this.insert(stmt, params);
       case "update":
-        return this.update(stmt, params);
       case "delete":
-        return this.delete(stmt, params);
+        return this.planFor(stmt, slot)(params);
       case "createTable":
         this.createTable(stmt, params);
         return empty();
@@ -320,8 +410,9 @@ export class Database {
           throw new SqlCatalogError(`View '${stmt.name}' already exists`);
         }
         const view = { name: stmt.name, columns: stmt.columns, query: stmt.query, queryText: stmt.queryText };
-        // Validate by compiling (also rejects parameters, which views cannot hold).
-        const compiled = new QueryCompiler(this.catalog, []).compileTop(stmt.query);
+        if (containsParams(stmt.query)) throw new SqlRuntimeError("Parameters are not allowed in views");
+        // Validate by compiling.
+        const compiled = new QueryCompiler(this.catalog, new ParamBox()).compileTop(stmt.query);
         if (stmt.columns && stmt.columns.length !== compiled.columns.length) {
           throw new SqlCatalogError(`View '${stmt.name}' declares ${stmt.columns.length} columns but its query returns ${compiled.columns.length}`);
         }
@@ -366,7 +457,9 @@ export class Database {
         this.transactionDepth = 0;
         return empty();
       case "explain": {
-        const compiler = new QueryCompiler(this.catalog, params);
+        const box = new ParamBox();
+        box.values = params;
+        const compiler = new QueryCompiler(this.catalog, box);
         const inner = stmt.statement;
         let lines: string[];
         if (inner.type === "select") {
@@ -430,15 +523,15 @@ export class Database {
   // DDL
   // -------------------------------------------------------------------------
 
-  private createTable(stmt: CreateTableStatement, params: SqlValue[] | Record<string, SqlValue>): void {
+  private createTable(stmt: CreateTableStatement, params: ParamValues): void {
     if (this.catalog.hasTable(stmt.name)) {
       if (stmt.ifNotExists) return;
       throw new SqlCatalogError(`Table '${stmt.name}' already exists`);
     }
 
     if (stmt.asSelect) {
-      const compiled = new QueryCompiler(this.catalog, params).compileTop(stmt.asSelect);
-      const rows = [...compiled.run()];
+      const compiled = this.runQuery(stmt.asSelect, params);
+      const rows = compiled.rows;
       const seen = new Set<string>();
       const columns: ColumnDef[] = compiled.columns.map((name) => {
         let unique = name;
@@ -616,6 +709,7 @@ export class Database {
 
   /** Records enough state to undo an in-place schema change of `table`. */
   private snapshotTable(table: Table): void {
+    this.catalog.touch();
     const columns = table.columns;
     const rows = new Map(table.rows);
     const indexColumns = table.indexes.map((i) => [i, i.columns] as const);
@@ -630,6 +724,7 @@ export class Database {
         table.populateIndex(index);
       }
       for (const [col, ref] of references) col.references = ref;
+      this.catalog.touch();
     });
   }
 
@@ -642,8 +737,10 @@ export class Database {
         fn(after);
         if (before.table !== after.table || before.column !== after.column) {
           c.references = after;
+          this.catalog.touch();
           this.journal.record(() => {
             c.references = before;
+            this.catalog.touch();
           });
         }
       }
@@ -656,7 +753,7 @@ export class Database {
 
   private evaluateDefault(expr: Expr): SqlValue {
     const compiled = compileExpr(expr, new Scope([]), {
-      params: [],
+      params: new ParamBox(),
       compileSubquery: () => {
         throw new SqlRuntimeError("Subqueries are not allowed in DEFAULT expressions");
       },
@@ -667,7 +764,7 @@ export class Database {
   private compileCheck(table: Table, check: Expr): (env: { row: SqlValue[] }) => boolean {
     const columns: ColumnInfo[] = table.columns.map((c) => ({ table: table.name, name: c.name }));
     const compiled = compileExpr(check, new Scope(columns), {
-      params: [],
+      params: new ParamBox(),
       compileSubquery: () => {
         throw new SqlRuntimeError("Subqueries are not allowed in CHECK constraints");
       },
@@ -766,40 +863,60 @@ export class Database {
     return { columns, evaluate: (row) => exprs.map((e) => e({ row })) };
   }
 
-  private insert(stmt: InsertStatement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
+  private planInsert(stmt: InsertStatement): Executor {
     const table = this.catalog.getTable(stmt.table);
-    const compiler = new QueryCompiler(this.catalog, params);
+    const box = new ParamBox();
+    const compiler = new QueryCompiler(this.catalog, box);
     const targetIdx = stmt.columns ? stmt.columns.map((c) => table.columnIndex(c)) : table.columns.map((_, i) => i);
     if (new Set(targetIdx).size !== targetIdx.length) throw new SqlCatalogError("Duplicate column in INSERT column list");
 
-    let sourceRows: SqlValue[][];
+    let sourceRows: () => SqlValue[][];
     if (stmt.select) {
       const compiled = compiler.compileTop(stmt.select);
       if (compiled.columns.length !== targetIdx.length) {
         throw new SqlRuntimeError(`INSERT expects ${targetIdx.length} values but the SELECT returns ${compiled.columns.length} columns`);
       }
       // Materialize first so `INSERT INTO t SELECT ... FROM t` terminates.
-      sourceRows = [...compiled.run()];
+      sourceRows = () => [...compiled.run()];
     } else {
       const values = stmt.values!;
       const isDefaultValues = values.length === 1 && values[0]!.length === 0 && !stmt.columns;
-      sourceRows = values.map((exprs) => {
+      const compiledRows = values.map((exprs) => {
         if (isDefaultValues) return [];
         if (exprs.length !== targetIdx.length) {
           throw new SqlRuntimeError(`INSERT expects ${targetIdx.length} values per row, got ${exprs.length}`);
         }
-        return exprs.map((e) => compiler.compileRowExpr(e, [])({ row: [] }));
+        return exprs.map((e) => compiler.compileRowExpr(e, []));
       });
       if (isDefaultValues) targetIdx.length = 0;
+      sourceRows = () => compiledRows.map((row) => row.map((value) => value({ row: [] })));
     }
 
     const upsert = this.compileUpsert(compiler, table, stmt);
     const returning = this.compileReturning(compiler, table, undefined, stmt.returning);
-    const returned: SqlValue[][] = [];
     const defaults = table.columns.map((c) => c.defaultValue);
     const autoCol = autoAssignColumn(table);
     const validate = this.rowValidator(table);
     const referenced = this.isReferenced(table);
+    return (params) => {
+      box.values = params;
+      compiler.beginRun();
+      return this.executeInsert(table, targetIdx, sourceRows(), defaults, autoCol, validate, referenced, upsert, returning);
+    };
+  }
+
+  private executeInsert(
+    table: Table,
+    targetIdx: number[],
+    sourceRows: SqlValue[][],
+    defaults: (Expr | undefined)[],
+    autoCol: number,
+    validate: (row: SqlValue[]) => SqlValue[],
+    referenced: boolean,
+    upsert: ReturnType<Database["compileUpsert"]>,
+    returning: ReturnType<Database["compileReturning"]>,
+  ): QueryResult {
+    const returned: SqlValue[][] = [];
     let lastInsertRowId: number | undefined;
     let changes = 0;
     const seqBefore = table.autoIncrementSeq;
@@ -886,9 +1003,10 @@ export class Database {
     };
   }
 
-  private update(stmt: UpdateStatement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
+  private planUpdate(stmt: UpdateStatement): Executor {
     const table = this.catalog.getTable(stmt.table);
-    const compiler = new QueryCompiler(this.catalog, params);
+    const box = new ParamBox();
+    const compiler = new QueryCompiler(this.catalog, box);
     const name = stmt.alias ?? table.name;
     const columns: ColumnInfo[] = table.columns.map((c) => ({ table: name, name: c.name }));
     const assignments: { col: number; value: Compiled }[] = stmt.assignments.map((a) => ({
@@ -897,38 +1015,47 @@ export class Database {
     }));
     const returning = this.compileReturning(compiler, table, stmt.alias, stmt.returning);
     const { scan } = compiler.compileTableScan(table, stmt.alias, stmt.where);
-    const ids = [...scan()];
     const validate = this.rowValidator(table);
     const referenced = this.isReferenced(table);
-    const returned: SqlValue[][] = [];
-    for (const id of ids) {
-      const oldRow = table.rows.get(id)!;
-      const newRow = oldRow.slice();
-      for (const a of assignments) newRow[a.col] = a.value({ row: oldRow });
-      const finalRow = validate(newRow);
-      if (referenced) this.checkNotReferenced(table, oldRow, finalRow);
-      table.update(id, finalRow, this.journal);
-      if (returning) returned.push(returning.evaluate(finalRow));
-    }
-    return { type: "update", columns: returning?.columns ?? [], rows: returned, changes: ids.length };
+    return (params) => {
+      box.values = params;
+      compiler.beginRun();
+      const ids = [...scan()];
+      const returned: SqlValue[][] = [];
+      for (const id of ids) {
+        const oldRow = table.rows.get(id)!;
+        const newRow = oldRow.slice();
+        for (const a of assignments) newRow[a.col] = a.value({ row: oldRow });
+        const finalRow = validate(newRow);
+        if (referenced) this.checkNotReferenced(table, oldRow, finalRow);
+        table.update(id, finalRow, this.journal);
+        if (returning) returned.push(returning.evaluate(finalRow));
+      }
+      return { type: "update", columns: returning?.columns ?? [], rows: returned, changes: ids.length };
+    };
   }
 
-  private delete(stmt: DeleteStatement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
+  private planDelete(stmt: DeleteStatement): Executor {
     const table = this.catalog.getTable(stmt.table);
-    const compiler = new QueryCompiler(this.catalog, params);
+    const box = new ParamBox();
+    const compiler = new QueryCompiler(this.catalog, box);
     const returning = this.compileReturning(compiler, table, stmt.alias, stmt.returning);
     const { scan } = compiler.compileTableScan(table, stmt.alias, stmt.where);
-    const ids = [...scan()];
     const referenced = this.isReferenced(table);
-    const returned: SqlValue[][] = [];
-    for (const id of ids) {
-      const row = table.rows.get(id)!;
-      // Evaluate RETURNING before the row disappears (its subqueries may read the table).
-      if (returning) returned.push(returning.evaluate(row));
-      table.delete(id, this.journal);
-      if (referenced) this.checkNotReferenced(table, row);
-    }
-    return { type: "delete", columns: returning?.columns ?? [], rows: returned, changes: ids.length };
+    return (params) => {
+      box.values = params;
+      compiler.beginRun();
+      const ids = [...scan()];
+      const returned: SqlValue[][] = [];
+      for (const id of ids) {
+        const row = table.rows.get(id)!;
+        // Evaluate RETURNING before the row disappears (its subqueries may read the table).
+        if (returning) returned.push(returning.evaluate(row));
+        table.delete(id, this.journal);
+        if (referenced) this.checkNotReferenced(table, row);
+      }
+      return { type: "delete", columns: returning?.columns ?? [], rows: returned, changes: ids.length };
+    };
   }
 
   private isReferenced(table: Table): boolean {

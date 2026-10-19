@@ -24,6 +24,7 @@ import {
   walkExpr,
   type Boundary,
   type ColumnInfo,
+  type ParamBox,
   type CompileContext,
   type Compiled,
   type Env,
@@ -189,10 +190,31 @@ export class QueryCompiler {
   /** Views currently being expanded, to detect circular definitions. */
   private readonly viewStack: string[] = [];
 
+  /** Incremented for every execution; run-scoped caches are keyed by it. */
+  private runId = 0;
+
   constructor(
     private readonly catalog: Catalog,
-    private readonly params: SqlValue[] | Record<string, SqlValue>,
+    private readonly params: ParamBox,
   ) {}
+
+  /** Starts a new execution of the compiled plans, invalidating run-scoped caches. */
+  beginRun(): void {
+    this.runId++;
+  }
+
+  /** Caches `compute()` for the duration of one execution. */
+  private perRun<T>(compute: () => T): () => T {
+    let at = -1;
+    let value: T;
+    return () => {
+      if (at !== this.runId) {
+        value = compute();
+        at = this.runId;
+      }
+      return value;
+    };
+  }
 
   private context(ctes: CteMap): CompileContext {
     return {
@@ -208,10 +230,14 @@ export class QueryCompiler {
       return { columnCount: compiled.columns.length, run: (env) => compiled.run(env) };
     }
     // Uncorrelated subqueries are evaluated once per statement execution.
-    let cache: SqlValue[][] | undefined;
+    let lastEnv: Env | undefined;
+    const cached = this.perRun(() => [...compiled.run(lastEnv)]);
     return {
       columnCount: compiled.columns.length,
-      run: (env) => (cache ??= [...compiled.run(env)]),
+      run: (env) => {
+        lastEnv = env;
+        return cached();
+      },
     };
   }
 
@@ -427,7 +453,8 @@ export class QueryCompiler {
     const cteBoundary: Boundary = { correlated: false };
     const compiled = this.compileSelect(def.query, outer, ctes, cteBoundary);
     const columns = renameColumns(def, compiled.columns);
-    let cache: SqlValue[][] | undefined;
+    let lastEnv: Env | undefined;
+    const cached = this.perRun(() => [...compiled.run(lastEnv)]);
     return {
       columns,
       volatile: false,
@@ -435,7 +462,8 @@ export class QueryCompiler {
       isCorrelated: () => cteBoundary.correlated,
       rows: (env) => {
         if (cteBoundary.correlated) return [...compiled.run(env)];
-        return (cache ??= [...compiled.run(env)]);
+        lastEnv = env;
+        return cached();
       },
     };
   }
@@ -470,7 +498,8 @@ export class QueryCompiler {
     }
 
     const limit = query.limit ? compileExpr(query.limit, new Scope([], outer, boundary), this.context(ctes)) : undefined;
-    let cache: SqlValue[][] | undefined;
+    let lastEnv: Env | undefined;
+    const cached = this.perRun(() => evaluate(lastEnv));
     const evaluate = (env: Env | undefined): SqlValue[][] => {
       const distinct = op === "UNION";
       const seen = new Set<string>();
@@ -509,7 +538,8 @@ export class QueryCompiler {
       isCorrelated: () => cteBoundary.correlated,
       rows: (env) => {
         if (cteBoundary.correlated) return evaluate(env);
-        return (cache ??= evaluate(env));
+        lastEnv = env;
+        return cached();
       },
     };
   }
@@ -667,12 +697,16 @@ export class QueryCompiler {
       keys: sortKeyExprs.map((k) => k(env)),
     });
 
-    function* filtered(env: Env | undefined): Generator<SqlValue[]> {
-      for (const row of source.rows(env)) {
-        if (where && !where({ row, outer: env })) continue;
-        yield row;
-      }
-    }
+    const filtered = where
+      ? function* (env: Env | undefined): Generator<SqlValue[]> {
+          const rowEnv: Env = { row: EMPTY_ROW, outer: env };
+          for (const row of source.rows(env)) {
+            rowEnv.row = row;
+            if (!where(rowEnv)) continue;
+            yield row;
+          }
+        }
+      : (env: Env | undefined): Iterable<SqlValue[]> => source.rows(env);
 
     /** Rows ready for projection: filtered source rows, or groups after HAVING. */
     function* grouped(env: Env | undefined): Generator<SqlValue[]> {
@@ -936,9 +970,16 @@ export class QueryCompiler {
         columns: leaf.columns,
         plan: { label: `SCAN ${table.name}${aliasLabel}${filterLabel}`, children: [] },
         rows: function* (env) {
-          for (const row of table.scan()) {
-            if (filter && !filter({ row, outer: env })) continue;
-            yield row;
+          // One env object is reused for every row; predicates never retain it.
+          const rowEnv: Env = { row: EMPTY_ROW, outer: env };
+          for (const chunk of table.scanChunks()) {
+            for (const row of chunk) {
+              if (filter) {
+                rowEnv.row = row;
+                if (!filter(rowEnv)) continue;
+              }
+              yield row;
+            }
           }
         },
       };
@@ -1172,37 +1213,73 @@ function renameColumns(def: CommonTableExpr, columns: string[]): string[] {
   return def.columns;
 }
 
-/** Whether a query mentions `name` in any FROM clause (used to detect recursive CTEs). */
-function referencesTable(query: SelectStatement, name: string): boolean {
-  const lname = name.toLowerCase();
-  let found = false;
+/**
+ * Visits every table reference and every expression of a query, including
+ * nested subqueries, CTEs, ORDER BY / LIMIT and window specifications.
+ */
+function walkSelect(query: SelectStatement, onTable: (ref: TableRef) => void, onExpr: (e: Expr) => void): void {
+  const visitExpr = (expr: Expr | undefined): void => {
+    if (!expr) return;
+    walkExpr(expr, (e) => {
+      onExpr(e);
+      if (e.kind === "subquery" || e.kind === "exists" || e.kind === "inSubquery") visitQuery(e.query);
+      if (e.kind === "function" && e.over?.frame) {
+        for (const b of [e.over.frame.start, e.over.frame.end]) if (b.kind === "preceding" || b.kind === "following") visitExpr(b.offset);
+      }
+    });
+  };
   const visitFrom = (item: FromItem | undefined): void => {
-    if (!item || found) return;
-    if (item.kind === "table") found ||= item.name.toLowerCase() === lname;
+    if (!item) return;
+    if (item.kind === "table") onTable(item);
     else if (item.kind === "subquery") visitQuery(item.query);
     else {
       visitFrom(item.left);
       visitFrom(item.right);
+      visitExpr(item.on);
     }
-  };
-  const visitExpr = (expr: Expr | undefined): void => {
-    if (!expr) return;
-    walkExpr(expr, (e) => {
-      if (e.kind === "subquery" || e.kind === "exists" || e.kind === "inSubquery") visitQuery(e.query);
-    });
   };
   const visitCore = (core: SelectCore): void => {
     visitFrom(core.from);
     visitExpr(core.where);
     visitExpr(core.having);
     for (const c of core.columns) visitExpr(c.expr);
+    for (const g of core.groupBy) visitExpr(g);
   };
   const visitQuery = (q: SelectStatement): void => {
     for (const cte of q.with) visitQuery(cte.query);
     visitCore(q.core);
     for (const c of q.compounds) visitCore(c.core);
+    for (const o of q.orderBy) visitExpr(o.expr);
+    visitExpr(q.limit);
+    visitExpr(q.offset);
   };
   visitQuery(query);
+}
+
+/** Whether a query mentions `name` in any FROM clause (used to detect recursive CTEs). */
+function referencesTable(query: SelectStatement, name: string): boolean {
+  const lname = name.toLowerCase();
+  let found = false;
+  walkSelect(
+    query,
+    (ref) => {
+      if (ref.name.toLowerCase() === lname) found = true;
+    },
+    () => {},
+  );
+  return found;
+}
+
+/** Whether a query contains any `?` / `:name` parameter. */
+export function containsParams(query: SelectStatement): boolean {
+  let found = false;
+  walkSelect(
+    query,
+    () => {},
+    (e) => {
+      if (e.kind === "param") found = true;
+    },
+  );
   return found;
 }
 

@@ -1,7 +1,7 @@
 {
   "name": "minisql",
   "version": "0.1.0",
-  "description": "A small, dependency-free relational SQL database engine written in TypeScript — lexer, parser, planner, executor, indexes, transactions and a REPL.",
+  "description": "A small, dependency-free relational SQL database engine written in TypeScript \u2014 lexer, parser, planner, executor, indexes, transactions and a REPL.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,7 +17,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "repl": "npm run build && node dist/cli.js",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "bench": "npm run build && node --no-warnings bench/bench.mjs"
   },
   "keywords": [
     "sql",

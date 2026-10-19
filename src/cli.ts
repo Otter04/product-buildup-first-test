@@ -95,6 +95,11 @@ function runSql(session: Session, sql: string): boolean {
   try {
     const results = session.db.exec(sql);
     for (const r of results) {
+      if (r.type === "explain" && session.mode === "table") {
+        // Plans read best as an indented tree, without table borders.
+        session.print(r.rows.map((row) => String(row[0])).join("\n"));
+        continue;
+      }
       if (r.columns.length > 0) {
         if (r.rows.length === 0 && session.mode === "table") session.print("(no rows)");
         else session.print(formatResult(r, session.mode, { color: session.color }));

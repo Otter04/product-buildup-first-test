@@ -48,6 +48,9 @@ export function compareValues(a: SqlValue, b: SqlValue): number {
  */
 export function sqlCompare(a: SqlValue, b: SqlValue): number | null {
   if (a === null || b === null) return null;
+  // Fast paths for the overwhelmingly common same-type comparisons.
+  const ta = typeof a;
+  if (ta === typeof b && ta !== "boolean") return a < b ? -1 : a > b ? 1 : 0;
   if (typeof a === "number" && typeof b === "string") {
     const n = Number(b);
     if (b.trim() !== "" && !Number.isNaN(n)) return a < n ? -1 : a > n ? 1 : 0;
