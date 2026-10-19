@@ -147,6 +147,14 @@ const WORKLOADS = [
     },
   },
   {
+    name: "top-10 by key (ORDER BY … LIMIT)",
+    run: (db) => {
+      const stmt = db.prepare("SELECT id, amount FROM orders ORDER BY id DESC LIMIT 10");
+      for (let i = 0; i < 1000; i++) stmt.all([]);
+      return 1000;
+    },
+  },
+  {
     name: "correlated subquery",
     run: (db) => {
       db.prepare(

@@ -67,6 +67,19 @@ interface Source {
   columns: ColumnInfo[];
   rows(outer: Env | undefined): Iterable<SqlValue[]>;
   plan: PlanNode;
+  /** True when rows come out in the order requested through an {@link OrderHint}. */
+  ordered?: boolean;
+}
+
+/**
+ * A request to produce a single table's rows sorted by some of its columns,
+ * so that ORDER BY needs no sort (and LIMIT can stop early).
+ */
+interface OrderHint {
+  /** Table column indexes, most significant first, each ascending (NULLs first) or descending (NULLs last). */
+  terms: { column: number; desc: boolean }[];
+  /** With a LIMIT, an ordered index scan beats a selective filter followed by a sort. */
+  hasLimit: boolean;
 }
 
 interface CteBinding {
@@ -319,8 +332,8 @@ export class QueryCompiler {
       const ctes = this.bindCtes(stmt.with, stmt.recursive ?? false, outer, inheritedCtes, boundary);
 
       if (stmt.compounds.length === 0) {
-        const core = this.compileCore(stmt.core, outer, ctes, boundary, stmt.orderBy);
-        return this.finish(core.columns, core.run, core.plan, stmt, outer, ctes, boundary, core.sortable);
+        const core = this.compileCore(stmt.core, outer, ctes, boundary, stmt.orderBy, stmt.limit !== undefined);
+        return this.finish(core.columns, core.run, core.plan, stmt, outer, ctes, boundary, core.presorted ? [] : core.sortable);
       }
 
       const cores = [stmt.core, ...stmt.compounds.map((c) => c.core)].map((c) => this.compileCore(c, outer, ctes, boundary, []));
@@ -359,6 +372,7 @@ export class QueryCompiler {
     sortable: SortSpec[] | undefined,
   ): CompiledQuery {
     let sort: SortSpec[] = sortable ?? [];
+    const presorted = sortable !== undefined && sortable.length === 0 && stmt.orderBy.length > 0;
     if (!sortable && stmt.orderBy.length) {
       // Compound queries can only be ordered by result columns.
       sort = stmt.orderBy.map((item) => {
@@ -374,8 +388,9 @@ export class QueryCompiler {
     const offset = stmt.offset ? compileExpr(stmt.offset, constScope, ctx) : undefined;
 
     let finalPlan = plan;
-    if (sort.length) {
-      finalPlan = { label: `SORT BY ${stmt.orderBy.map((o) => `${exprToSql(o.expr)} ${o.direction}`).join(", ")}`, children: [finalPlan] };
+    if (sort.length || presorted) {
+      const label = `${presorted ? "ORDER BY (from index)" : "SORT BY"} ${stmt.orderBy.map((o) => `${exprToSql(o.expr)} ${o.direction}`).join(", ")}`;
+      finalPlan = { label, children: [finalPlan] };
     }
     if (limit || offset) {
       const parts = [stmt.limit ? `LIMIT ${exprToSql(stmt.limit)}` : "", stmt.offset ? `OFFSET ${exprToSql(stmt.offset)}` : ""].filter(Boolean);
@@ -554,12 +569,20 @@ export class QueryCompiler {
     ctes: CteMap,
     boundary: Boundary,
     orderBy: OrderByItem[],
-  ): { columns: string[]; run: (env: Env | undefined) => Iterable<{ out: SqlValue[]; keys: SqlValue[] }>; plan: PlanNode; sortable: SortSpec[] } {
+    hasLimit = false,
+  ): {
+    columns: string[];
+    run: (env: Env | undefined) => Iterable<{ out: SqlValue[]; keys: SqlValue[] }>;
+    plan: PlanNode;
+    sortable: SortSpec[];
+    presorted: boolean;
+  } {
     const ctx = this.context(ctes);
     const whereConjuncts = splitConjuncts(core.where);
     if (whereConjuncts.some(hasAggregates)) throw new SqlRuntimeError("Aggregate functions are not allowed in WHERE");
+    const orderHint = orderBy.length ? this.orderHint(core, orderBy, ctes, hasLimit) : undefined;
     const { source, residual } = core.from
-      ? this.compileFrom(core.from, whereConjuncts, outer, ctes, boundary)
+      ? this.compileFrom(core.from, whereConjuncts, outer, ctes, boundary, orderHint)
       : { source: singleRowSource(), residual: whereConjuncts };
 
     const scope = new Scope(source.columns, outer, boundary);
@@ -773,7 +796,46 @@ export class QueryCompiler {
     plan = { label: `PROJECT ${columns.join(", ")}`, children: [plan] };
     if (distinct) plan = { label: "DISTINCT", children: [plan] };
 
-    return { columns, run, plan, sortable };
+    return { columns, run, plan, sortable, presorted: orderHint !== undefined && source.ordered === true };
+  }
+
+  /**
+   * Works out whether ORDER BY could be satisfied by reading a single table in
+   * index order: only plain column references in one direction, and nothing
+   * (aggregation, windows, DISTINCT) that would reorder rows afterwards.
+   */
+  private orderHint(core: SelectCore, orderBy: OrderByItem[], ctes: CteMap, hasLimit: boolean): OrderHint | undefined {
+    const from = core.from;
+    if (!from || from.kind !== "table" || ctes.has(from.name.toLowerCase()) || this.catalog.findView(from.name)) return undefined;
+    const table = this.catalog.findTable(from.name);
+    if (!table || core.distinct || core.groupBy.length || core.having) return undefined;
+    for (const item of core.columns) {
+      if (item.expr.kind !== "star" && (hasAggregates(item.expr) || hasWindows(item.expr))) return undefined;
+    }
+    const qualifier = (from.alias ?? from.name).toLowerCase();
+    const hasStar = core.columns.some((c) => c.expr.kind === "star");
+    const terms: OrderHint["terms"] = [];
+    for (const term of orderBy) {
+      if (hasAggregates(term.expr) || hasWindows(term.expr)) return undefined;
+      let expr = term.expr;
+      if (expr.kind === "literal") {
+        // ORDER BY <position>: only resolvable here without `*` in the select list.
+        if (hasStar || typeof expr.value !== "number" || !Number.isInteger(expr.value)) return undefined;
+        const item = core.columns[expr.value - 1];
+        if (!item) return undefined;
+        expr = item.expr;
+      } else if (expr.kind === "column" && !expr.table) {
+        const name = expr.name.toLowerCase();
+        const aliased = core.columns.find((c) => c.alias?.toLowerCase() === name);
+        if (aliased) expr = aliased.expr;
+      }
+      if (expr.kind !== "column" || (expr.table && expr.table.toLowerCase() !== qualifier) || !table.hasColumn(expr.name)) return undefined;
+      // The index yields NULLs first going forwards and last going backwards.
+      const desc = term.direction === "DESC";
+      if (term.nulls && (term.nulls === "FIRST") === desc) return undefined;
+      terms.push({ column: table.columnIndex(expr.name), desc });
+    }
+    return { terms, hasLimit };
   }
 
   // -------------------------------------------------------------------------
@@ -786,6 +848,7 @@ export class QueryCompiler {
     outer: Scope | undefined,
     ctes: CteMap,
     boundary: Boundary,
+    orderHint?: OrderHint,
   ): { source: Source; residual: Expr[] } {
     const leaves: LeafNode[] = [];
     const tree = this.buildFromTree(from, outer, ctes, leaves);
@@ -872,7 +935,7 @@ export class QueryCompiler {
       place(c, tree, (e) => residual.push(e));
     }
 
-    const source = this.buildSource(tree, outer, ctes, boundary);
+    const source = tree.kind === "leaf" ? this.leafSource(tree, outer, ctes, boundary, orderHint) : this.buildSource(tree, outer, ctes, boundary);
     return { source, residual };
   }
 
@@ -938,7 +1001,7 @@ export class QueryCompiler {
     return this.joinSource(node, left, right, outer, ctes, boundary);
   }
 
-  private leafSource(leaf: LeafNode, outer: Scope | undefined, ctes: CteMap, boundary: Boundary): Source {
+  private leafSource(leaf: LeafNode, outer: Scope | undefined, ctes: CteMap, boundary: Boundary, order?: OrderHint): Source {
     const ctx = this.context(ctes);
     const scope = new Scope(leaf.columns, outer, boundary);
     const filter = leaf.pushed.length ? predicate(compileAll(leaf.pushed, scope, ctx)) : undefined;
@@ -963,8 +1026,48 @@ export class QueryCompiler {
     }
 
     const table = leaf.table!;
-    const access = chooseAccessPath(table, leaf.pushed, scope);
+    let access = chooseAccessPath(table, leaf.pushed, scope);
     const constScope = new Scope([], outer, boundary);
+
+    // Serve ORDER BY from an index when the access path (or a full index scan) already sorts the rows.
+    let reverse = false;
+    let ordered = false;
+    let orderedScan: Index | undefined;
+    if (order) {
+      const viaAccess = access ? accessOrder(access, order.terms) : undefined;
+      if (viaAccess) {
+        ordered = true;
+        reverse = viaAccess.reverse;
+      } else if ((!access || order.hasLimit) && order.terms.every((t) => t.desc === order.terms[0]!.desc)) {
+        orderedScan = table.indexes.find((ix) => order.terms.every((t, i) => ix.columnIndexes[i] === t.column));
+        if (orderedScan) {
+          ordered = true;
+          reverse = order.terms[0]!.desc;
+          access = undefined;
+        }
+      }
+    }
+
+    if (orderedScan) {
+      const index = orderedScan;
+      return {
+        columns: leaf.columns,
+        ordered,
+        plan: { label: `SCAN ${table.name}${aliasLabel} USING INDEX ${index.name}${reverse ? " (reverse)" : ""}${filterLabel}`, children: [] },
+        rows: function* (env) {
+          const rowEnv: Env = { row: EMPTY_ROW, outer: env };
+          for (const id of index.scan(reverse)) {
+            const row = table.rows.get(id)!;
+            if (filter) {
+              rowEnv.row = row;
+              if (!filter(rowEnv)) continue;
+            }
+            yield row;
+          }
+        },
+      };
+    }
+
     if (!access) {
       return {
         columns: leaf.columns,
@@ -995,24 +1098,41 @@ export class QueryCompiler {
       ...(access.upper ? [`${index.columns[access.eqColumns.length]}${access.upper.inclusive ? "<=" : "<"}?`] : []),
     ].join(" AND ");
 
+    const orderTerms = order?.terms ?? [];
     return {
       columns: leaf.columns,
-      plan: { label: `SEARCH ${table.name}${aliasLabel} USING INDEX ${index.name} (${describeAccess})${filterLabel}`, children: [] },
+      ordered,
+      plan: {
+        label: `SEARCH ${table.name}${aliasLabel} USING INDEX ${index.name} (${describeAccess})${ordered && reverse ? " (reverse)" : ""}${filterLabel}`,
+        children: [],
+      },
       rows: function* (env) {
         const constEnv: Env = { row: EMPTY_ROW, outer: env };
-        const ids = indexRowIds(index, table, eqAlternatives, lower, upper, constEnv);
-        const source: Iterable<SqlValue[]> = ids
-          ? (function* () {
-              for (const id of ids) {
-                const row = table.rows.get(id);
-                if (row) yield row;
-              }
-            })()
-          : table.scan();
-        for (const row of source) {
-          if (filter && !filter({ row, outer: env })) continue;
-          yield row;
+        const ids = indexRowIds(index, table, eqAlternatives, lower, upper, constEnv, ordered && reverse);
+        if (ids) {
+          const rowEnv: Env = { row: EMPTY_ROW, outer: env };
+          for (const id of ids) {
+            const row = table.rows.get(id);
+            if (!row) continue;
+            if (filter) {
+              rowEnv.row = row;
+              if (!filter(rowEnv)) continue;
+            }
+            yield row;
+          }
+          return;
         }
+        // The probe values cannot be looked up exactly: scan everything (sorting if order was promised).
+        const matching: SqlValue[][] = [];
+        for (const row of table.scan()) {
+          if (filter && !filter({ row, outer: env })) continue;
+          if (!ordered) {
+            yield row;
+            continue;
+          }
+          matching.push(row);
+        }
+        if (ordered) yield* sortRowsBy(matching, orderTerms);
       },
     };
   }
@@ -1182,6 +1302,38 @@ function compileAll(exprs: Expr[], scope: Scope, ctx: CompileContext): Compiled 
     }
     return sawNull ? null : true;
   };
+}
+
+/**
+ * Whether an index access path returns rows in the requested order, and in
+ * which direction. Columns pinned by single-value equalities are constant and
+ * can be ignored; the rest must be the index columns that follow the equality
+ * prefix, all sorted in the same direction.
+ */
+function accessOrder(access: AccessPath, terms: OrderHint["terms"]): { reverse: boolean } | undefined {
+  if (access.eqColumns.some((alts) => alts.length !== 1)) return undefined;
+  const eqCount = access.eqColumns.length;
+  const pinned = new Set(access.index.columnIndexes.slice(0, eqCount));
+  const rest = terms.filter((t) => !pinned.has(t.column));
+  if (!rest.every((t, i) => access.index.columnIndexes[eqCount + i] === t.column && t.desc === rest[0]!.desc)) return undefined;
+  return { reverse: rest[0]?.desc ?? false };
+}
+
+/** Sorts rows by table columns in index order (NULLs first), each term ascending or descending. */
+function sortRowsBy(rows: SqlValue[][], terms: OrderHint["terms"]): SqlValue[][] {
+  return [...rows].sort((a, b) => {
+    for (const t of terms) {
+      const d = compareValues(a[t.column]!, b[t.column]!);
+      if (d !== 0) return t.desc ? -d : d;
+    }
+    return 0;
+  });
+}
+
+function hasWindows(expr: Expr): boolean {
+  const found: FunctionCallExpr[] = [];
+  collectWindows(expr, found);
+  return found.length > 0;
 }
 
 /** For `GROUP BY 1` / `ORDER BY 2`: zero-based position of a result column. */
@@ -1465,6 +1617,7 @@ function indexRowIds(
   lower: { value: Compiled; inclusive: boolean } | undefined,
   upper: { value: Compiled; inclusive: boolean } | undefined,
   env: Env,
+  reverse = false,
 ): Iterable<number> | undefined {
   // Build the cartesian product of equality alternatives.
   let prefixes: SqlValue[][] = [[]];
@@ -1500,6 +1653,7 @@ function indexRowIds(
     hi = { value: pv, inclusive: upper.inclusive };
   }
   if (prefixes.length === 1) {
+    if (reverse) return index.range(prefixes[0]!, lo, hi, true);
     return lo || hi ? index.range(prefixes[0]!, lo, hi) : index.lookup(prefixes[0]!);
   }
   const seen = new Set<number>();
