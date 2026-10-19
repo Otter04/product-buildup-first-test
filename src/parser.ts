@@ -11,12 +11,16 @@ import type {
   DeleteStatement,
   DropIndexStatement,
   DropTableStatement,
+  Assignment,
+  CreateViewStatement,
+  DropViewStatement,
   Expr,
   FrameBound,
   FromItem,
   FunctionCallExpr,
   InsertStatement,
   JoinType,
+  OnConflict,
   OrderByItem,
   SelectCore,
   SelectItem,
@@ -35,6 +39,13 @@ import { tokenize, type Token, type TokenType } from "./lexer.js";
  */
 const SOFT_KEYWORDS = new Set([
   "ADD",
+  "CONFLICT",
+  "DO",
+  "ESCAPE",
+  "GLOB",
+  "NOTHING",
+  "RETURNING",
+  "VIEW",
   "CURRENT",
   "FOLLOWING",
   "OVER",
@@ -303,9 +314,21 @@ export class Parser {
   private parseCreate(): Statement {
     this.expectKeyword("CREATE");
     if (this.matchKeyword("TABLE")) return this.parseCreateTable();
+    if (this.matchKeyword("VIEW")) return this.parseCreateView();
     const unique = this.matchKeyword("UNIQUE");
     if (this.matchKeyword("INDEX")) return this.parseCreateIndex(unique);
-    return this.fail(`Expected TABLE or INDEX after CREATE`);
+    return this.fail(`Expected TABLE, VIEW or INDEX after CREATE`);
+  }
+
+  private parseCreateView(): CreateViewStatement {
+    const ifNotExists = this.parseIfNotExists();
+    const name = this.parseIdentifier("view name");
+    const columns = this.isPunct("(") ? this.parseIdentifierList() : undefined;
+    this.expectKeyword("AS");
+    const start = this.peek().start;
+    const query = this.parseSelect();
+    const queryText = this.source.slice(start, this.tokens[this.pos - 1]!.end);
+    return { type: "createView", name, columns, query, queryText, ifNotExists };
   }
 
   private parseIfNotExists(): boolean {
@@ -430,8 +453,12 @@ export class Parser {
     return { type: "createIndex", name, table, columns, unique, ifNotExists };
   }
 
-  private parseDrop(): DropTableStatement | DropIndexStatement {
+  private parseDrop(): DropTableStatement | DropIndexStatement | DropViewStatement {
     this.expectKeyword("DROP");
+    if (this.matchKeyword("VIEW")) {
+      const ifExists = this.parseIfExists();
+      return { type: "dropView", name: this.parseIdentifier("view name"), ifExists };
+    }
     if (this.matchKeyword("TABLE")) {
       const ifExists = this.parseIfExists();
       return { type: "dropTable", name: this.parseIdentifier("table name"), ifExists };
@@ -440,7 +467,7 @@ export class Parser {
       const ifExists = this.parseIfExists();
       return { type: "dropIndex", name: this.parseIdentifier("index name"), ifExists };
     }
-    return this.fail("Expected TABLE or INDEX after DROP");
+    return this.fail("Expected TABLE, VIEW or INDEX after DROP");
   }
 
   private parseAlter(): AlterTableStatement {
@@ -475,6 +502,7 @@ export class Parser {
     if (this.isPunct("(") && !this.isKeyword("SELECT", 1) && !this.isKeyword("WITH", 1)) {
       columns = this.parseIdentifierList();
     }
+    let stmt: InsertStatement;
     if (this.matchKeyword("VALUES")) {
       const values: Expr[][] = [];
       do {
@@ -487,15 +515,49 @@ export class Parser {
         this.expectPunct(")");
         values.push(row);
       } while (this.matchPunct(","));
-      return { type: "insert", table, columns, values };
+      stmt = { type: "insert", table, columns, values };
+    } else if (this.matchKeyword("DEFAULT", "VALUES")) {
+      stmt = { type: "insert", table, columns, values: [[]] };
+    } else if (this.isKeyword("SELECT") || this.isKeyword("WITH") || this.isPunct("(")) {
+      stmt = { type: "insert", table, columns, select: this.parseSelect() };
+    } else {
+      return this.fail(`Expected VALUES or SELECT but found ${this.describe(this.peek())}`);
     }
-    if (this.matchKeyword("DEFAULT", "VALUES")) {
-      return { type: "insert", table, columns, values: [[]] };
-    }
-    if (this.isKeyword("SELECT") || this.isKeyword("WITH") || this.isPunct("(")) {
-      return { type: "insert", table, columns, select: this.parseSelect() };
-    }
-    return this.fail(`Expected VALUES or SELECT but found ${this.describe(this.peek())}`);
+    if (this.matchKeyword("ON", "CONFLICT")) stmt.onConflict = this.parseOnConflict();
+    stmt.returning = this.parseReturning();
+    return stmt;
+  }
+
+  private parseOnConflict(): OnConflict {
+    const target = this.isPunct("(") ? this.parseIdentifierList() : undefined;
+    this.expectKeyword("DO");
+    if (this.matchKeyword("NOTHING")) return { target, action: "nothing", assignments: [] };
+    this.expectKeyword("UPDATE");
+    if (!target) this.fail("ON CONFLICT DO UPDATE requires a conflict target, e.g. ON CONFLICT (id)");
+    this.expectKeyword("SET");
+    const assignments = this.parseAssignments();
+    const where = this.matchKeyword("WHERE") ? this.parseExpr() : undefined;
+    return { target, action: "update", assignments, where };
+  }
+
+  private parseAssignments(): Assignment[] {
+    const assignments: Assignment[] = [];
+    do {
+      let column = this.parseIdentifier("column name");
+      // Allow `SET t.col = ...`.
+      if (this.matchPunct(".")) column = this.parseIdentifier("column name");
+      if (!this.matchOperator("=")) this.fail(`Expected '=' in SET clause`);
+      assignments.push({ column, value: this.parseExpr() });
+    } while (this.matchPunct(","));
+    return assignments;
+  }
+
+  private parseReturning(): SelectItem[] | undefined {
+    if (!this.matchKeyword("RETURNING")) return undefined;
+    const items: SelectItem[] = [];
+    do items.push(this.parseSelectItem());
+    while (this.matchPunct(","));
+    return items;
   }
 
   private parseOptionalAlias(): string | undefined {
@@ -509,16 +571,9 @@ export class Parser {
     const table = this.parseIdentifier("table name");
     const alias = this.isKeyword("SET") ? undefined : this.parseOptionalAlias();
     this.expectKeyword("SET");
-    const assignments: { column: string; value: Expr }[] = [];
-    do {
-      let column = this.parseIdentifier("column name");
-      // Allow `SET t.col = ...`.
-      if (this.matchPunct(".")) column = this.parseIdentifier("column name");
-      if (!this.matchOperator("=")) this.fail(`Expected '=' in SET clause`);
-      assignments.push({ column, value: this.parseExpr() });
-    } while (this.matchPunct(","));
+    const assignments = this.parseAssignments();
     const where = this.matchKeyword("WHERE") ? this.parseExpr() : undefined;
-    return { type: "update", table, alias, assignments, where };
+    return { type: "update", table, alias, assignments, where, returning: this.parseReturning() };
   }
 
   private parseDelete(): DeleteStatement {
@@ -526,7 +581,7 @@ export class Parser {
     const table = this.parseIdentifier("table name");
     const alias = this.isKeyword("WHERE") ? undefined : this.parseOptionalAlias();
     const where = this.matchKeyword("WHERE") ? this.parseExpr() : undefined;
-    return { type: "delete", table, alias, where };
+    return { type: "delete", table, alias, where, returning: this.parseReturning() };
   }
 
   // -------------------------------------------------------------------------
@@ -826,7 +881,8 @@ export class Parser {
         }
         continue;
       }
-      const negated = this.isKeyword("NOT") && (this.isKeyword("IN", 1) || this.isKeyword("LIKE", 1) || this.isKeyword("BETWEEN", 1));
+      const negated =
+        this.isKeyword("NOT") && (this.isKeyword("IN", 1) || this.isKeyword("LIKE", 1) || this.isKeyword("GLOB", 1) || this.isKeyword("BETWEEN", 1));
       if (negated) this.next();
       if (this.matchKeyword("IN")) {
         this.expectPunct("(");
@@ -845,8 +901,11 @@ export class Parser {
         }
         continue;
       }
-      if (this.matchKeyword("LIKE")) {
-        left = { kind: "like", operand: left, pattern: this.parseAdditive(), negated };
+      if (this.isKeyword("LIKE") || this.isKeyword("GLOB")) {
+        const op = this.next().value as "LIKE" | "GLOB";
+        const pattern = this.parseAdditive();
+        const escape = op === "LIKE" && this.matchKeyword("ESCAPE") ? this.parseAdditive() : undefined;
+        left = { kind: "like", op, operand: left, pattern, escape, negated };
         continue;
       }
       if (this.matchKeyword("BETWEEN")) {
@@ -856,7 +915,7 @@ export class Parser {
         left = { kind: "between", operand: left, low, high, negated };
         continue;
       }
-      if (negated) this.fail("Expected IN, LIKE or BETWEEN after NOT");
+      if (negated) this.fail("Expected IN, LIKE, GLOB or BETWEEN after NOT");
       return left;
     }
   }

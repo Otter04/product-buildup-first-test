@@ -34,8 +34,8 @@ describe("CREATE / DROP TABLE", () => {
   it("lists tables and describes columns", () => {
     const db = sampleDb();
     expect(rows(db, "SHOW TABLES")).toEqual([
-      ["departments", 3, 4],
-      ["employees", 6, 7],
+      ["departments", "table", 3, 4],
+      ["employees", "table", 6, 7],
     ]);
     expect(rows(db, "DESCRIBE employees").slice(0, 3)).toEqual([
       ["id", "INTEGER", "NO", "PRI", null, "autoincrement"],

@@ -6,14 +6,15 @@ import type {
   DeleteStatement,
   Expr,
   InsertStatement,
+  SelectItem,
   Statement,
   UpdateStatement,
 } from "./ast.js";
-import { compileExpr, exprToSql, normalizeParam, quoteIdent, Scope, walkExpr, type ColumnInfo, type Compiled } from "./compiler.js";
+import { compileExpr, exprToSql, normalizeParam, quoteIdent, Scope, walkExpr, type ColumnInfo, type Compiled, type Env } from "./compiler.js";
 import { SqlCatalogError, SqlConstraintError, SqlError, SqlRuntimeError } from "./errors.js";
 import { Parser, parseExpression } from "./parser.js";
 import { QueryCompiler, renderPlan } from "./planner.js";
-import { Catalog, Index, Journal, Table } from "./storage.js";
+import { Catalog, Index, Journal, Table, type View } from "./storage.js";
 import { coerceToType, formatValue, sqlCompare, toBool, toSqlLiteral, type Row, type SqlValue } from "./values.js";
 
 /** Parameters bound to `?` (array) or `:name` / `$name` / `@name` (object) placeholders. */
@@ -42,6 +43,7 @@ export interface DatabaseSnapshot {
   version: 1;
   tables: { schema: string; rows: SqlValue[][]; autoIncrementSeq: number }[];
   indexes: string[];
+  views?: string[];
 }
 
 /** Converts a result's rows into objects keyed by column name. */
@@ -178,16 +180,26 @@ export class Database {
     return this.catalog.allTables().map((t) => t.name);
   }
 
+  /** Names of all views. */
+  views(): string[] {
+    return this.catalog.allViews().map((v) => v.name);
+  }
+
+  private viewColumns(view: View): string[] {
+    return view.columns ?? new QueryCompiler(this.catalog, []).compileTop(view.query).columns;
+  }
+
   /** Column definitions of a table. */
   columns(table: string): ColumnDef[] {
     return this.catalog.getTable(table).columns.map((c) => ({ ...c }));
   }
 
-  /** The `CREATE TABLE` / `CREATE INDEX` statements describing the schema. */
+  /** The `CREATE TABLE` / `CREATE INDEX` / `CREATE VIEW` statements describing the schema. */
   schema(): string {
     const parts: string[] = [];
     for (const table of this.orderedTables()) parts.push(createTableSql(table) + ";");
     for (const index of this.catalog.allIndexes()) if (!index.implicit) parts.push(createIndexSql(index) + ";");
+    for (const view of this.catalog.allViews()) parts.push(createViewSql(view) + ";");
     return parts.join("\n");
   }
 
@@ -202,6 +214,7 @@ export class Database {
       }
     }
     for (const index of this.catalog.allIndexes()) if (!index.implicit) lines.push(createIndexSql(index) + ";");
+    for (const view of this.catalog.allViews()) lines.push(createViewSql(view) + ";");
     lines.push("COMMIT;");
     return lines.join("\n") + "\n";
   }
@@ -221,6 +234,7 @@ export class Database {
         .allIndexes()
         .filter((i) => !i.implicit)
         .map(createIndexSql),
+      views: this.catalog.allViews().map(createViewSql),
     };
   }
 
@@ -240,6 +254,7 @@ export class Database {
       table.autoIncrementSeq = t.autoIncrementSeq;
     }
     for (const sql of snapshot.indexes) db.exec(sql);
+    for (const sql of snapshot.views ?? []) db.exec(sql);
     db.journal.truncate();
     return db;
   }
@@ -281,6 +296,7 @@ export class Database {
       case "dropTable": {
         const table = this.catalog.findTable(stmt.name);
         if (!table) {
+          if (this.catalog.findView(stmt.name)) throw new SqlCatalogError(`'${stmt.name}' is a view; use DROP VIEW`);
           if (stmt.ifExists) return empty();
           throw new SqlCatalogError(`No such table: ${stmt.name}`);
         }
@@ -298,6 +314,29 @@ export class Database {
       case "createIndex":
         this.createIndex(stmt);
         return empty();
+      case "createView": {
+        if (this.catalog.findView(stmt.name)) {
+          if (stmt.ifNotExists) return empty();
+          throw new SqlCatalogError(`View '${stmt.name}' already exists`);
+        }
+        const view = { name: stmt.name, columns: stmt.columns, query: stmt.query, queryText: stmt.queryText };
+        // Validate by compiling (also rejects parameters, which views cannot hold).
+        const compiled = new QueryCompiler(this.catalog, []).compileTop(stmt.query);
+        if (stmt.columns && stmt.columns.length !== compiled.columns.length) {
+          throw new SqlCatalogError(`View '${stmt.name}' declares ${stmt.columns.length} columns but its query returns ${compiled.columns.length}`);
+        }
+        this.catalog.addView(view, this.journal);
+        return empty();
+      }
+      case "dropView": {
+        const view = this.catalog.findView(stmt.name);
+        if (!view) {
+          if (stmt.ifExists) return empty();
+          throw new SqlCatalogError(`No such view: ${stmt.name}`);
+        }
+        this.catalog.removeView(view, this.journal);
+        return empty();
+      }
       case "dropIndex": {
         const index = this.catalog.getIndex(stmt.name);
         if (!index) {
@@ -339,14 +378,26 @@ export class Database {
         }
         return { type: "explain", columns: ["plan"], rows: lines.map((l) => [l]), changes: 0 };
       }
-      case "showTables":
+      case "showTables": {
+        const tables: SqlValue[][] = this.catalog.allTables().map((t) => [t.name, "table", t.columns.length, t.rows.size]);
+        const views: SqlValue[][] = this.catalog.allViews().map((v) => [v.name, "view", this.viewColumns(v).length, null]);
         return {
           type: "showTables",
-          columns: ["name", "columns", "rows"],
-          rows: this.catalog.allTables().map((t) => [t.name, t.columns.length, t.rows.size]),
+          columns: ["name", "type", "columns", "rows"],
+          rows: [...tables, ...views].sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
           changes: 0,
         };
+      }
       case "describe": {
+        const view = this.catalog.findView(stmt.table);
+        if (view) {
+          return {
+            type: "describe",
+            columns: ["name", "type", "nullable", "key", "default", "extra"],
+            rows: this.viewColumns(view).map((c) => [c, "ANY", "YES", "", null, "view column"]),
+            changes: 0,
+          };
+        }
         const table = this.catalog.getTable(stmt.table);
         const pk = table.primaryKey;
         return {
@@ -686,6 +737,35 @@ export class Database {
     }
   }
 
+  /** Compiles a RETURNING clause into a function producing one result row per affected row. */
+  private compileReturning(
+    compiler: QueryCompiler,
+    table: Table,
+    alias: string | undefined,
+    items: SelectItem[] | undefined,
+  ): { columns: string[]; evaluate: (row: SqlValue[]) => SqlValue[] } | undefined {
+    if (!items) return undefined;
+    const qualifier = alias ?? table.name;
+    const scopeColumns: ColumnInfo[] = table.columns.map((c) => ({ table: qualifier, name: c.name }));
+    const columns: string[] = [];
+    const exprs: Compiled[] = [];
+    for (const item of items) {
+      if (item.expr.kind === "star") {
+        if (item.expr.table && item.expr.table.toLowerCase() !== qualifier.toLowerCase()) {
+          throw new SqlCatalogError(`No such table: ${item.expr.table}`);
+        }
+        table.columns.forEach((c, i) => {
+          columns.push(c.name);
+          exprs.push((env) => env.row[i]!);
+        });
+        continue;
+      }
+      columns.push(item.alias ?? (item.expr.kind === "column" ? item.expr.name : item.text ?? exprToSql(item.expr)));
+      exprs.push(compiler.compileRowExpr(item.expr, scopeColumns));
+    }
+    return { columns, evaluate: (row) => exprs.map((e) => e({ row })) };
+  }
+
   private insert(stmt: InsertStatement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
     const table = this.catalog.getTable(stmt.table);
     const compiler = new QueryCompiler(this.catalog, params);
@@ -713,10 +793,15 @@ export class Database {
       if (isDefaultValues) targetIdx.length = 0;
     }
 
+    const upsert = this.compileUpsert(compiler, table, stmt);
+    const returning = this.compileReturning(compiler, table, undefined, stmt.returning);
+    const returned: SqlValue[][] = [];
     const defaults = table.columns.map((c) => c.defaultValue);
     const autoCol = autoAssignColumn(table);
     const validate = this.rowValidator(table);
+    const referenced = this.isReferenced(table);
     let lastInsertRowId: number | undefined;
+    let changes = 0;
     const seqBefore = table.autoIncrementSeq;
     this.journal.record(() => {
       table.autoIncrementSeq = seqBefore;
@@ -731,24 +816,74 @@ export class Database {
         if (row[i] !== undefined) continue;
         row[i] = defaults[i] ? this.evaluateDefault(defaults[i]!) : null;
       }
-      if (autoCol >= 0) {
-        const v = row[autoCol];
-        if (v === null) {
-          // Like SQLite: AUTOINCREMENT never reuses a value; a plain INTEGER
-          // PRIMARY KEY takes one more than the current maximum.
-          const max = maxIntegerIn(table, autoCol);
-          row[autoCol] = table.columns[autoCol]!.autoIncrement ? Math.max(table.autoIncrementSeq, max) + 1 : max + 1;
-        }
-        const assigned = row[autoCol];
-        if (typeof assigned === "number" && Number.isInteger(assigned) && table.columns[autoCol]!.autoIncrement) {
-          table.autoIncrementSeq = Math.max(table.autoIncrementSeq, assigned);
-        }
+      if (autoCol >= 0 && row[autoCol] === null) {
+        // Like SQLite: AUTOINCREMENT never reuses a value; a plain INTEGER
+        // PRIMARY KEY takes one more than the current maximum.
+        const max = maxIntegerIn(table, autoCol);
+        row[autoCol] = table.columns[autoCol]!.autoIncrement ? Math.max(table.autoIncrementSeq, max) + 1 : max + 1;
       }
       const finalRow = validate(row as SqlValue[]);
+
+      if (upsert) {
+        const conflictId = upsert.findConflict(finalRow);
+        if (conflictId !== undefined) {
+          if (upsert.action === "nothing") continue;
+          const existing = table.rows.get(conflictId)!;
+          const env = { row: existing, outer: { row: finalRow } };
+          if (upsert.where && !upsert.where(env)) continue;
+          const updated = existing.slice();
+          for (const a of upsert.assignments) updated[a.col] = a.value(env);
+          const validated = validate(updated);
+          if (referenced) this.checkNotReferenced(table, existing, validated);
+          table.update(conflictId, validated, this.journal);
+          changes++;
+          if (returning) returned.push(returning.evaluate(validated));
+          continue;
+        }
+      }
+
+      if (autoCol >= 0 && table.columns[autoCol]!.autoIncrement) {
+        const assigned = finalRow[autoCol];
+        if (typeof assigned === "number") table.autoIncrementSeq = Math.max(table.autoIncrementSeq, assigned);
+      }
       const rowId = table.insert(finalRow, this.journal);
       lastInsertRowId = autoCol >= 0 ? (finalRow[autoCol] as number) : rowId;
+      changes++;
+      if (returning) returned.push(returning.evaluate(finalRow));
     }
-    return { type: "insert", columns: [], rows: [], changes: sourceRows.length, lastInsertRowId };
+    return { type: "insert", columns: returning?.columns ?? [], rows: returned, changes, lastInsertRowId };
+  }
+
+  /** Prepares the ON CONFLICT clause of an INSERT, if any. */
+  private compileUpsert(compiler: QueryCompiler, table: Table, stmt: InsertStatement) {
+    const clause = stmt.onConflict;
+    if (!clause) return undefined;
+    let target: Index | undefined;
+    if (clause.target) {
+      const cols = clause.target.map((c) => table.columnIndex(c)).sort((a, b) => a - b);
+      target = table.indexes.find(
+        (ix) => ix.unique && ix.columnIndexes.length === cols.length && [...ix.columnIndexes].sort((a, b) => a - b).every((c, i) => c === cols[i]),
+      );
+      if (!target) throw new SqlCatalogError("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint");
+    }
+    // DO UPDATE expressions see the existing row as the table and the proposed
+    // row as `excluded` (an outer scope, so unqualified names mean the table).
+    const columns: ColumnInfo[] = table.columns.map((c) => ({ table: table.name, name: c.name }));
+    const excluded: ColumnInfo[] = table.columns.map((c) => ({ table: "excluded", name: c.name }));
+    return {
+      action: clause.action,
+      assignments: clause.assignments.map((a) => ({ col: table.columnIndex(a.column), value: compiler.compileRowExpr(a.value, columns, excluded) })),
+      where: clause.where ? predicateOf(compiler.compileRowExpr(clause.where, columns, excluded)) : undefined,
+      findConflict: (row: SqlValue[]): number | undefined => {
+        if (target) return target.findConflict(row);
+        for (const ix of table.indexes) {
+          if (!ix.unique) continue;
+          const hit = ix.findConflict(row);
+          if (hit !== undefined) return hit;
+        }
+        return undefined;
+      },
+    };
   }
 
   private update(stmt: UpdateStatement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
@@ -760,10 +895,12 @@ export class Database {
       col: table.columnIndex(a.column),
       value: compiler.compileRowExpr(a.value, columns),
     }));
+    const returning = this.compileReturning(compiler, table, stmt.alias, stmt.returning);
     const { scan } = compiler.compileTableScan(table, stmt.alias, stmt.where);
     const ids = [...scan()];
     const validate = this.rowValidator(table);
     const referenced = this.isReferenced(table);
+    const returned: SqlValue[][] = [];
     for (const id of ids) {
       const oldRow = table.rows.get(id)!;
       const newRow = oldRow.slice();
@@ -771,22 +908,27 @@ export class Database {
       const finalRow = validate(newRow);
       if (referenced) this.checkNotReferenced(table, oldRow, finalRow);
       table.update(id, finalRow, this.journal);
+      if (returning) returned.push(returning.evaluate(finalRow));
     }
-    return { type: "update", columns: [], rows: [], changes: ids.length };
+    return { type: "update", columns: returning?.columns ?? [], rows: returned, changes: ids.length };
   }
 
   private delete(stmt: DeleteStatement, params: SqlValue[] | Record<string, SqlValue>): QueryResult {
     const table = this.catalog.getTable(stmt.table);
     const compiler = new QueryCompiler(this.catalog, params);
+    const returning = this.compileReturning(compiler, table, stmt.alias, stmt.returning);
     const { scan } = compiler.compileTableScan(table, stmt.alias, stmt.where);
     const ids = [...scan()];
     const referenced = this.isReferenced(table);
+    const returned: SqlValue[][] = [];
     for (const id of ids) {
       const row = table.rows.get(id)!;
+      // Evaluate RETURNING before the row disappears (its subqueries may read the table).
+      if (returning) returned.push(returning.evaluate(row));
       table.delete(id, this.journal);
       if (referenced) this.checkNotReferenced(table, row);
     }
-    return { type: "delete", columns: [], rows: [], changes: ids.length };
+    return { type: "delete", columns: returning?.columns ?? [], rows: returned, changes: ids.length };
   }
 
   private isReferenced(table: Table): boolean {
@@ -868,6 +1010,10 @@ function findRow(table: Table, col: number, value: SqlValue): SqlValue[] | undef
   return undefined;
 }
 
+function predicateOf(compiled: Compiled): (env: Env) => boolean {
+  return (env) => toBool(compiled(env)) === true;
+}
+
 function renameColumnInExpr(expr: Expr, from: string, to: string): Expr {
   const clone = structuredClone(expr);
   walkExpr(clone, (e) => {
@@ -901,6 +1047,11 @@ export function createTableSql(table: Table): string {
 
 function wrapDefault(expr: Expr): string {
   return expr.kind === "literal" ? exprToSql(expr) : `(${exprToSql(expr)})`;
+}
+
+export function createViewSql(view: View): string {
+  const columns = view.columns ? ` (${view.columns.map(quoteIdent).join(", ")})` : "";
+  return `CREATE VIEW ${quoteIdent(view.name)}${columns} AS ${view.queryText}`;
 }
 
 export function createIndexSql(index: Index): string {

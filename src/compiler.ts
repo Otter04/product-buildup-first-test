@@ -1,6 +1,6 @@
 import type { Expr, FrameBound, FunctionCallExpr, SelectStatement, WindowSpec } from "./ast.js";
 import { SqlCatalogError, SqlRuntimeError } from "./errors.js";
-import { isAggregateCall, like, lookupScalar } from "./functions.js";
+import { glob, isAggregateCall, like, lookupScalar } from "./functions.js";
 import { castValue, sqlCompare, toBool, toNumber, toText, type SqlValue } from "./values.js";
 import { WINDOW_ONLY_FUNCTIONS } from "./window.js";
 
@@ -127,6 +127,7 @@ export function walkExpr(expr: Expr, visit: (e: Expr) => boolean | void): void {
     case "like":
       walkExpr(expr.operand, visit);
       walkExpr(expr.pattern, visit);
+      if (expr.escape) walkExpr(expr.escape, visit);
       break;
     case "case":
       if (expr.operand) walkExpr(expr.operand, visit);
@@ -458,12 +459,20 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
     case "like": {
       const operand = compileExpr(expr.operand, scope, ctx);
       const pattern = compileExpr(expr.pattern, scope, ctx);
+      const escape = expr.escape ? compileExpr(expr.escape, scope, ctx) : undefined;
       const negated = expr.negated;
+      const isGlob = expr.op === "GLOB";
       return (env) => {
         const v = operand(env);
         const p = pattern(env);
         if (v === null || p === null) return null;
-        const r = like(toText(v)!, toText(p)!);
+        let r: boolean;
+        if (isGlob) r = glob(toText(v)!, toText(p)!);
+        else if (escape) {
+          const e = escape(env);
+          if (e === null) return null;
+          r = like(toText(v)!, toText(p)!, toText(e)!);
+        } else r = like(toText(v)!, toText(p)!);
         return negated ? !r : r;
       };
     }
@@ -589,7 +598,7 @@ export function exprToSql(expr: Expr): string {
     case "subquery":
       return "(<subquery>)";
     case "like":
-      return `${wrap(expr.operand)} ${expr.negated ? "NOT " : ""}LIKE ${wrap(expr.pattern)}`;
+      return `${wrap(expr.operand)} ${expr.negated ? "NOT " : ""}${expr.op} ${wrap(expr.pattern)}${expr.escape ? ` ESCAPE ${exprToSql(expr.escape)}` : ""}`;
     case "case": {
       let s = "CASE";
       if (expr.operand) s += ` ${exprToSql(expr.operand)}`;

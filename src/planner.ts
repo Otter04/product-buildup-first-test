@@ -186,6 +186,8 @@ const FLIP: Record<string, string> = { "<": ">", "<=": ">=", ">": "<", ">=": "<=
 
 export class QueryCompiler {
   private readonly boundaryStack: Boundary[] = [];
+  /** Views currently being expanded, to detect circular definitions. */
+  private readonly viewStack: string[] = [];
 
   constructor(
     private readonly catalog: Catalog,
@@ -218,10 +220,15 @@ export class QueryCompiler {
     return this.compileSelect(stmt, undefined, new Map(), { correlated: false });
   }
 
-  /** Compiles an expression evaluated against the columns of one table (UPDATE/DELETE/CHECK). */
-  compileRowExpr(expr: Expr, columns: ColumnInfo[]): Compiled {
+  /**
+   * Compiles an expression evaluated against the columns of one table
+   * (UPDATE / DELETE / RETURNING). `outerColumns`, if given, are visible
+   * through `env.outer` and lose to `columns` on unqualified name clashes.
+   */
+  compileRowExpr(expr: Expr, columns: ColumnInfo[], outerColumns?: ColumnInfo[]): Compiled {
     const boundary: Boundary = { correlated: false };
-    return this.withBoundary(boundary, () => compileExpr(expr, new Scope(columns, undefined, boundary), this.context(new Map())));
+    const parent = outerColumns ? new Scope(outerColumns) : undefined;
+    return this.withBoundary(boundary, () => compileExpr(expr, new Scope(columns, parent, boundary), this.context(new Map())));
   }
 
   /**
@@ -866,6 +873,24 @@ export class QueryCompiler {
       }
       const columns = cte.columns.map((c) => ({ table: name, name: c }));
       return { kind: "leaf", id, name, columns, offset: 0, cte, pushed: [] };
+    }
+    const view = this.catalog.findView(item.name);
+    if (view) {
+      const key = view.name.toLowerCase();
+      if (this.viewStack.includes(key)) throw new SqlCatalogError(`View '${view.name}' is defined in terms of itself`);
+      this.viewStack.push(key);
+      try {
+        // Views are self-contained: they see neither the enclosing query nor its CTEs.
+        const query = this.compileSelect(view.query, undefined, new Map(), { correlated: false });
+        const names = view.columns ?? query.columns;
+        if (names.length !== query.columns.length) {
+          throw new SqlCatalogError(`View '${view.name}' declares ${names.length} columns but its query returns ${query.columns.length}`);
+        }
+        const columns = names.map((c) => ({ table: name, name: c }));
+        return { kind: "leaf", id, name, columns, offset: 0, query, pushed: [] };
+      } finally {
+        this.viewStack.pop();
+      }
     }
     const table = this.catalog.getTable(item.name);
     const columns = table.columns.map((c) => ({ table: name, name: c.name }));

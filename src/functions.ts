@@ -635,21 +635,82 @@ export function createAccumulator(name: string, argc: number, star: boolean, dis
 // LIKE
 // ---------------------------------------------------------------------------
 
-const likeCache = new Map<string, RegExp>();
+const patternCache = new Map<string, RegExp>();
 
-/** Case-insensitive LIKE with `%` and `_` wildcards. */
-export function like(value: string, pattern: string): boolean {
-  let re = likeCache.get(pattern);
+function cached(key: string, build: () => RegExp): RegExp {
+  let re = patternCache.get(key);
   if (!re) {
-    let src = "^";
-    for (const ch of chars(pattern)) {
-      if (ch === "%") src += "[\\s\\S]*";
-      else if (ch === "_") src += "[\\s\\S]";
-      else src += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    }
-    re = new RegExp(src + "$", "iu");
-    if (likeCache.size > 500) likeCache.clear();
-    likeCache.set(pattern, re);
+    re = build();
+    if (patternCache.size > 500) patternCache.clear();
+    patternCache.set(key, re);
   }
+  return re;
+}
+
+function escapeRegExp(ch: string): string {
+  return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Case-insensitive LIKE with `%` and `_` wildcards. An optional escape
+ * character makes the following `%`, `_` or escape character literal.
+ */
+export function like(value: string, pattern: string, escape?: string): boolean {
+  if (escape !== undefined && chars(escape).length !== 1) throw new SqlRuntimeError("ESCAPE expression must be a single character");
+  const re = cached(`L${escape ?? ""}\u0000${pattern}`, () => {
+    let src = "^";
+    const cs = chars(pattern);
+    for (let i = 0; i < cs.length; i++) {
+      const ch = cs[i]!;
+      if (escape !== undefined && ch === escape) {
+        const next = cs[++i];
+        if (next === undefined) throw new SqlRuntimeError("LIKE pattern ends with the escape character");
+        src += escapeRegExp(next);
+      } else if (ch === "%") src += "[\\s\\S]*";
+      else if (ch === "_") src += "[\\s\\S]";
+      else src += escapeRegExp(ch);
+    }
+    return new RegExp(src + "$", "iu");
+  });
+  return re.test(value);
+}
+
+/** Case-sensitive GLOB with `*`, `?` and `[...]` character classes (`[^...]` negates). */
+export function glob(value: string, pattern: string): boolean {
+  const re = cached(`G\u0000${pattern}`, () => {
+    let src = "^";
+    const cs = chars(pattern);
+    for (let i = 0; i < cs.length; i++) {
+      const ch = cs[i]!;
+      if (ch === "*") src += "[\\s\\S]*";
+      else if (ch === "?") src += "[\\s\\S]";
+      else if (ch === "[") {
+        let j = i + 1;
+        let cls = "";
+        if (cs[j] === "^") {
+          cls += "^";
+          j++;
+        }
+        // A ']' right after '[' (or '[^') is a literal member of the class.
+        if (cs[j] === "]") {
+          cls += "\\]";
+          j++;
+        }
+        while (j < cs.length && cs[j] !== "]") {
+          const c = cs[j]!;
+          cls += c === "-" && j > i + 1 && cs[j + 1] !== "]" ? "-" : escapeRegExp(c);
+          j++;
+        }
+        if (j >= cs.length) {
+          // Unterminated class: treat '[' literally.
+          src += "\\[";
+          continue;
+        }
+        src += `[${cls}]`;
+        i = j;
+      } else src += escapeRegExp(ch);
+    }
+    return new RegExp(src + "$", "u");
+  });
   return re.test(value);
 }

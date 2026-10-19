@@ -104,8 +104,11 @@ export interface ExistsExpr {
 
 export interface LikeExpr {
   kind: "like";
+  /** LIKE is case-insensitive with `%` / `_`; GLOB is case-sensitive with `*` / `?` / `[...]`. */
+  op: "LIKE" | "GLOB";
   operand: Expr;
   pattern: Expr;
+  escape?: Expr;
   negated: boolean;
 }
 
@@ -231,6 +234,19 @@ export interface AlterTableStatement {
   action: AlterAction;
 }
 
+export interface Assignment {
+  column: string;
+  value: Expr;
+}
+
+/** `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` */
+export interface OnConflict {
+  target?: string[];
+  action: "nothing" | "update";
+  assignments: Assignment[];
+  where?: Expr;
+}
+
 export interface InsertStatement {
   type: "insert";
   table: string;
@@ -238,14 +254,17 @@ export interface InsertStatement {
   /** Either literal rows (`VALUES`) or a query (`INSERT ... SELECT`). */
   values?: Expr[][];
   select?: SelectStatement;
+  onConflict?: OnConflict;
+  returning?: SelectItem[];
 }
 
 export interface UpdateStatement {
   type: "update";
   table: string;
   alias?: string;
-  assignments: { column: string; value: Expr }[];
+  assignments: Assignment[];
   where?: Expr;
+  returning?: SelectItem[];
 }
 
 export interface DeleteStatement {
@@ -253,6 +272,23 @@ export interface DeleteStatement {
   table: string;
   alias?: string;
   where?: Expr;
+  returning?: SelectItem[];
+}
+
+export interface CreateViewStatement {
+  type: "createView";
+  name: string;
+  columns?: string[];
+  query: SelectStatement;
+  /** Source text of the view's query, kept for schema dumps. */
+  queryText: string;
+  ifNotExists: boolean;
+}
+
+export interface DropViewStatement {
+  type: "dropView";
+  name: string;
+  ifExists: boolean;
 }
 
 export interface SelectItem {
@@ -342,6 +378,8 @@ export interface DescribeStatement {
 export type Statement =
   | CreateTableStatement
   | DropTableStatement
+  | CreateViewStatement
+  | DropViewStatement
   | CreateIndexStatement
   | DropIndexStatement
   | AlterTableStatement

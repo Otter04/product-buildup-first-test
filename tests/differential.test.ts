@@ -432,7 +432,27 @@ function randomDml(r: Random): string {
     }
     return r.chance(0.85) ? ` WHERE ${predicate(ctx).replace(/EXISTS \(SELECT 1 FROM t\d s\d+[^)]*\)/g, "1 = 1")}` : "";
   };
-  switch (r.int(0, 3)) {
+  const returning = (): string => {
+    if (!r.chance(0.3)) return "";
+    const items = r.chance(0.3) ? ["*"] : Array.from({ length: r.int(1, 2) }, () => (r.chance(0.6) ? intExpr(ctx) : textExpr(ctx)));
+    return ` RETURNING ${items.map((e, i) => (e === "*" ? e : `${e} AS r${i}`)).join(", ")}`;
+  };
+  switch (r.int(0, 4)) {
+    case 4: {
+      // Upsert against the primary key with ids likely to collide.
+      const values = [
+        String(r.int(1, 25)),
+        ...t.intCols.map(() => (r.chance(0.15) ? "NULL" : String(r.int(-3, 8)))),
+        ...t.textCols.map(() => (r.chance(0.15) ? "NULL" : `'${r.pick(WORDS)}'`)),
+      ];
+      let action = "DO NOTHING";
+      if (r.chance(0.7)) {
+        const col = r.pick(t.intCols);
+        const value = r.pick([`excluded.${col}`, `${t.name}.${col} + 1`, `COALESCE(${t.name}.${col}, 0) + COALESCE(excluded.${col}, 0)`, String(r.int(-3, 8))]);
+        action = `DO UPDATE SET ${col} = ${value}${r.chance(0.3) ? ` WHERE ${t.name}.${t.intCols[0]} IS NOT NULL` : ""}`;
+      }
+      return `INSERT INTO ${t.name} VALUES (${values.join(", ")}) ON CONFLICT${action === "DO NOTHING" && r.chance(0.5) ? "" : " (id)"} ${action}${returning()}`;
+    }
     case 0: {
       const n = r.int(1, 3);
       const rowsSql = Array.from({ length: n }, () => {
@@ -443,7 +463,7 @@ function randomDml(r: Random): string {
         ];
         return `(${values.join(", ")})`;
       });
-      return `INSERT INTO ${t.name} VALUES ${rowsSql.join(", ")}`;
+      return `INSERT INTO ${t.name} VALUES ${rowsSql.join(", ")}${returning()}`;
     }
     case 1: {
       const o = r.pick(others);
@@ -454,10 +474,10 @@ function randomDml(r: Random): string {
       const col = r.pick([...t.intCols, ...t.textCols]);
       const isText = t.textCols.includes(col);
       const value = isText ? textExpr({ ...ctx, ints: cols.ints, texts: cols.texts }) : intExpr(ctx);
-      return `UPDATE ${t.name} SET ${col} = ${value}${where()}`;
+      return `UPDATE ${t.name} SET ${col} = ${value}${where()}${returning()}`;
     }
     default:
-      return `DELETE FROM ${t.name}${where()}`;
+      return `DELETE FROM ${t.name}${where()}${returning()}`;
   }
 }
 
@@ -478,16 +498,19 @@ describe.skipIf(!DatabaseSync)("differential DML testing against SQLite", () => 
       const r = new Random(seed * 31 + 5);
       for (let i = 0; i < 150; i++) {
         const sql = randomDml(r);
+        let expectedReturned: unknown[][];
         try {
-          sqlite.exec(sql);
+          expectedReturned = sqlite.prepare(sql).all().map((row) => Object.values(row));
         } catch {
           continue;
         }
+        let actualReturned: unknown[][];
         try {
-          indexed.exec(sql);
+          actualReturned = indexed.exec(sql)[0]!.rows;
         } catch (e) {
           throw new Error(`minisql failed on: ${sql}\n${(e as Error).message}`);
         }
+        expect(canonical(actualReturned, false), `RETURNING of: ${sql}`).toEqual(canonical(expectedReturned, false));
         if (i % 10 === 9) {
           const expected = tableContents((q) => sqlite.prepare(q).all().map((row) => Object.values(row)));
           const actual = tableContents((q) => indexed.exec(q)[0]!.rows);

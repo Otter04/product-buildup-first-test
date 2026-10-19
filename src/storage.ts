@@ -1,4 +1,4 @@
-import type { ColumnDef, ColumnType, Expr } from "./ast.js";
+import type { ColumnDef, ColumnType, Expr, SelectStatement } from "./ast.js";
 import { BPlusTree } from "./btree.js";
 import { SqlCatalogError, SqlConstraintError } from "./errors.js";
 import { compareValues, formatValue, type SqlValue } from "./values.js";
@@ -293,27 +293,49 @@ export class Table {
   }
 }
 
-export interface ColumnSchema {
+/** A stored query that can be referenced like a table. */
+export interface View {
   name: string;
-  type: ColumnType;
-  notNull: boolean;
-  primaryKey: boolean;
-  unique: boolean;
-  autoIncrement: boolean;
-  defaultValue?: Expr;
-  check?: Expr;
-  references?: { table: string; column?: string };
+  columns?: string[];
+  query: SelectStatement;
+  /** Source text of the query, used to reproduce the CREATE VIEW statement. */
+  queryText: string;
 }
 
-/** All tables and indexes known to a database. Names are case-insensitive. */
+/** All tables, views and indexes known to a database. Names are case-insensitive. */
 export class Catalog {
   private readonly tables = new Map<string, Table>();
+  private readonly views = new Map<string, View>();
   private readonly indexes = new Map<string, Index>();
 
   getTable(name: string): Table {
     const table = this.tables.get(name.toLowerCase());
-    if (!table) throw new SqlCatalogError(`No such table: ${name}`);
+    if (!table) {
+      if (this.views.has(name.toLowerCase())) throw new SqlCatalogError(`'${name}' is a view, not a table`);
+      throw new SqlCatalogError(`No such table: ${name}`);
+    }
     return table;
+  }
+
+  findView(name: string): View | undefined {
+    return this.views.get(name.toLowerCase());
+  }
+
+  allViews(): View[] {
+    return [...this.views.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  addView(view: View, journal: Journal): void {
+    const key = view.name.toLowerCase();
+    if (this.views.has(key) || this.tables.has(key)) throw new SqlCatalogError(`Table or view '${view.name}' already exists`);
+    this.views.set(key, view);
+    journal.record(() => this.views.delete(key));
+  }
+
+  removeView(view: View, journal: Journal): void {
+    const key = view.name.toLowerCase();
+    this.views.delete(key);
+    journal.record(() => this.views.set(key, view));
   }
 
   findTable(name: string): Table | undefined {
@@ -331,6 +353,7 @@ export class Catalog {
   addTable(table: Table, journal: Journal): void {
     const key = table.name.toLowerCase();
     if (this.tables.has(key)) throw new SqlCatalogError(`Table '${table.name}' already exists`);
+    if (this.views.has(key)) throw new SqlCatalogError(`A view named '${table.name}' already exists`);
     this.tables.set(key, table);
     journal.record(() => this.tables.delete(key));
   }
@@ -347,7 +370,7 @@ export class Catalog {
   }
 
   renameTable(table: Table, newName: string, journal: Journal): void {
-    if (this.hasTable(newName)) throw new SqlCatalogError(`Table '${newName}' already exists`);
+    if (this.hasTable(newName) || this.findView(newName)) throw new SqlCatalogError(`Table or view '${newName}' already exists`);
     const oldName = table.name;
     this.tables.delete(oldName.toLowerCase());
     table.name = newName;

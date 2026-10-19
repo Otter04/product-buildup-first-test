@@ -113,6 +113,13 @@ export const KEYWORDS = new Set([
   "FOLLOWING",
   "CURRENT",
   "ROW",
+  "VIEW",
+  "CONFLICT",
+  "DO",
+  "NOTHING",
+  "RETURNING",
+  "ESCAPE",
+  "GLOB",
 ]);
 
 const TWO_CHAR_OPERATORS = new Set(["<=", ">=", "<>", "!=", "||", "=="]);
