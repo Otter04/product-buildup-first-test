@@ -373,6 +373,8 @@ export interface TransactionStatement {
 
 export interface ExplainStatement {
   type: "explain";
+  /** `EXPLAIN ANALYZE`: run the query and report row counts per plan node. */
+  analyze?: boolean;
   statement: SelectStatement | UpdateStatement | DeleteStatement;
 }
 

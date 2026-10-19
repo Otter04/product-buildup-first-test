@@ -40,6 +40,7 @@ import { tokenize, type Token, type TokenType } from "./lexer.js";
  */
 const SOFT_KEYWORDS = new Set([
   "ADD",
+  "ANALYZE",
   "IGNORE",
   "REPLACE",
   "WINDOW",
@@ -298,11 +299,13 @@ export class Parser {
           return { type: "rollback" };
         case "EXPLAIN": {
           this.next();
+          const analyze = this.matchKeyword("ANALYZE");
           const inner = this.parseStatement();
           if (inner.type !== "select" && inner.type !== "update" && inner.type !== "delete") {
             this.fail("EXPLAIN supports SELECT, UPDATE and DELETE statements", tok);
           }
-          return { type: "explain", statement: inner };
+          if (analyze && inner.type !== "select") this.fail("EXPLAIN ANALYZE supports SELECT statements only", tok);
+          return { type: "explain", statement: inner, analyze };
         }
         case "SHOW":
           this.next();

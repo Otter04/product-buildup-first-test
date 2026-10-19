@@ -123,6 +123,7 @@ export const KEYWORDS = new Set([
   "IGNORE",
   "REPLACE",
   "WINDOW",
+  "ANALYZE",
 ]);
 
 const TWO_CHAR_OPERATORS = new Set(["<=", ">=", "<>", "!=", "||", "=="]);

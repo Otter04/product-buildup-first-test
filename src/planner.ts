@@ -25,6 +25,7 @@ import {
   type Boundary,
   type ColumnInfo,
   type ParamBox,
+  type SubqueryKind,
   type CompileContext,
   type Compiled,
   type Env,
@@ -40,12 +41,23 @@ import { compareValues, rowKey, toBool, toNumber, type SqlValue } from "./values
 export interface PlanNode {
   label: string;
   children: PlanNode[];
+  /** Filled in by EXPLAIN ANALYZE: rows produced and number of times the node was started. */
+  stats?: { rows: number; loops: number };
+  /** Marks an expression subquery; EXPLAIN ANALYZE reports how often it was evaluated. */
+  subquery?: boolean;
 }
 
-export function renderPlan(node: PlanNode): string[] {
+/** Renders a plan as an indented tree. With `analyze`, nodes show their runtime statistics. */
+export function renderPlan(node: PlanNode, analyze = false): string[] {
   const lines: string[] = [];
+  const statsOf = (n: PlanNode): string => {
+    if (!analyze) return "";
+    if (n.subquery) return ` (calls=${n.stats?.loops ?? 0})`;
+    if (!n.stats) return " (never executed)";
+    return ` (rows=${n.stats.rows}${n.stats.loops > 1 ? ` loops=${n.stats.loops}` : ""})`;
+  };
   const visit = (n: PlanNode, prefix: string, childPrefix: string): void => {
-    lines.push(prefix + n.label);
+    lines.push(prefix + n.label + statsOf(n));
     n.children.forEach((c, i) => {
       const last = i === n.children.length - 1;
       visit(c, childPrefix + (last ? "└─ " : "├─ "), childPrefix + (last ? "   " : "│  "));
@@ -206,10 +218,34 @@ export class QueryCompiler {
   /** Incremented for every execution; run-scoped caches are keyed by it. */
   private runId = 0;
 
+  /** Plans of expression subqueries compiled for the SELECT core currently being compiled. */
+  private readonly subplanStack: PlanNode[][] = [];
+
   constructor(
     private readonly catalog: Catalog,
     private readonly params: ParamBox,
+    /** Count rows per plan node (EXPLAIN ANALYZE). */
+    private readonly analyze = false,
   ) {}
+
+  /** Wraps an iterable so that consuming it updates `node.stats` (only when analyzing). */
+  private counted<T>(node: PlanNode, rows: Iterable<T>): Iterable<T> {
+    if (!this.analyze) return rows;
+    return (function* () {
+      const stats = (node.stats ??= { rows: 0, loops: 0 });
+      stats.loops++;
+      for (const row of rows) {
+        stats.rows++;
+        yield row;
+      }
+    })();
+  }
+
+  private withStats(source: Source): Source {
+    if (!this.analyze) return source;
+    const inner = source.rows;
+    return { ...source, rows: (env) => this.counted(source.plan, inner(env)) };
+  }
 
   /** Starts a new execution of the compiled plans, invalidating run-scoped caches. */
   beginRun(): void {
@@ -232,15 +268,31 @@ export class QueryCompiler {
   private context(ctes: CteMap): CompileContext {
     return {
       params: this.params,
-      compileSubquery: (query, outer) => this.compileSubquery(query, outer, ctes),
+      compileSubquery: (query, outer, kind) => this.compileSubquery(query, outer, ctes, kind),
     };
   }
 
-  private compileSubquery(query: SelectStatement, outer: Scope, ctes: CteMap): SubqueryRunner {
+  private compileSubquery(query: SelectStatement, outer: Scope, ctes: CteMap, kind: SubqueryKind): SubqueryRunner {
     const boundary: Boundary = { correlated: false };
     const compiled = this.compileSelect(query, outer, ctes, boundary);
+    const node: PlanNode = {
+      label: `${kind} SUBQUERY${boundary.correlated ? " (correlated)" : " (evaluated once)"}`,
+      children: [compiled.plan],
+      subquery: true,
+    };
+    this.subplanStack[this.subplanStack.length - 1]?.push(node);
+    const analyze = this.analyze;
+    const call = (): void => {
+      if (analyze) (node.stats ??= { rows: 0, loops: 0 }).loops++;
+    };
     if (boundary.correlated) {
-      return { columnCount: compiled.columns.length, run: (env) => compiled.run(env) };
+      return {
+        columnCount: compiled.columns.length,
+        run: (env) => {
+          call();
+          return compiled.run(env);
+        },
+      };
     }
     // Uncorrelated subqueries are evaluated once per statement execution.
     let lastEnv: Env | undefined;
@@ -248,6 +300,7 @@ export class QueryCompiler {
     return {
       columnCount: compiled.columns.length,
       run: (env) => {
+        call();
         lastEnv = env;
         return cached();
       },
@@ -388,14 +441,17 @@ export class QueryCompiler {
     const offset = stmt.offset ? compileExpr(stmt.offset, constScope, ctx) : undefined;
 
     let finalPlan = plan;
+    let sortNode: PlanNode | undefined;
+    let limitNode: PlanNode | undefined;
     if (sort.length || presorted) {
       const label = `${presorted ? "ORDER BY (from index)" : "SORT BY"} ${stmt.orderBy.map((o) => `${exprToSql(o.expr)} ${o.direction}`).join(", ")}`;
-      finalPlan = { label, children: [finalPlan] };
+      finalPlan = sortNode = { label, children: [finalPlan] };
     }
     if (limit || offset) {
       const parts = [stmt.limit ? `LIMIT ${exprToSql(stmt.limit)}` : "", stmt.offset ? `OFFSET ${exprToSql(stmt.offset)}` : ""].filter(Boolean);
-      finalPlan = { label: parts.join(" "), children: [finalPlan] };
+      finalPlan = limitNode = { label: parts.join(" "), children: [finalPlan] };
     }
+    const counted = <T>(node: PlanNode | undefined, rows: Iterable<T>): Iterable<T> => (node ? this.counted(node, rows) : rows);
 
     const evalCount = (c: Compiled | undefined, env: Env | undefined, what: string): number | undefined => {
       if (!c) return undefined;
@@ -405,6 +461,21 @@ export class QueryCompiler {
       if (!Number.isInteger(n)) throw new SqlRuntimeError(`${what} must be an integer`);
       return n;
     };
+
+    function* limited(rows: Iterable<{ out: SqlValue[]; keys: SqlValue[] }>, env: Env | undefined): Generator<SqlValue[]> {
+      let skip = evalCount(offset, env, "OFFSET") ?? 0;
+      let remaining = evalCount(limit, env, "LIMIT");
+      if (remaining !== undefined && remaining < 0) remaining = undefined;
+      if (remaining === 0) return;
+      for (const r of rows) {
+        if (skip > 0) {
+          skip--;
+          continue;
+        }
+        yield r.out;
+        if (remaining !== undefined && --remaining <= 0) return;
+      }
+    }
 
     return {
       columns,
@@ -430,18 +501,9 @@ export class QueryCompiler {
           });
           rows = all;
         }
-        let skip = evalCount(offset, env, "OFFSET") ?? 0;
-        let remaining = evalCount(limit, env, "LIMIT");
-        if (remaining !== undefined && remaining < 0) remaining = undefined;
-        if (remaining === 0) return;
-        for (const r of rows) {
-          if (skip > 0) {
-            skip--;
-            continue;
-          }
-          yield r.out;
-          if (remaining !== undefined && --remaining <= 0) return;
-        }
+        rows = counted(sortNode, rows);
+        if (limitNode) yield* counted(limitNode, limited(rows, env));
+        else for (const r of rows) yield r.out;
       },
     };
   }
@@ -577,6 +639,22 @@ export class QueryCompiler {
     sortable: SortSpec[];
     presorted: boolean;
   } {
+    this.subplanStack.push([]);
+    try {
+      return this.compileCoreInner(core, outer, ctes, boundary, orderBy, hasLimit);
+    } finally {
+      this.subplanStack.pop();
+    }
+  }
+
+  private compileCoreInner(
+    core: SelectCore,
+    outer: Scope | undefined,
+    ctes: CteMap,
+    boundary: Boundary,
+    orderBy: OrderByItem[],
+    hasLimit: boolean,
+  ): ReturnType<QueryCompiler["compileCore"]> {
     const ctx = this.context(ctes);
     const whereConjuncts = splitConjuncts(core.where);
     if (whereConjuncts.some(hasAggregates)) throw new SqlRuntimeError("Aggregate functions are not allowed in WHERE");
@@ -720,15 +798,22 @@ export class QueryCompiler {
       keys: sortKeyExprs.map((k) => k(env)),
     });
 
+    // Plan nodes are created at the end; the stage generators below only read them at run time.
+    const nodes: { filter?: PlanNode; group?: PlanNode; project?: PlanNode; distinct?: PlanNode } = {};
+    const count = <T>(node: PlanNode | undefined, rows: Iterable<T>): Iterable<T> => (node ? this.counted(node, rows) : rows);
     const filtered = where
-      ? function* (env: Env | undefined): Generator<SqlValue[]> {
-          const rowEnv: Env = { row: EMPTY_ROW, outer: env };
-          for (const row of source.rows(env)) {
-            rowEnv.row = row;
-            if (!where(rowEnv)) continue;
-            yield row;
-          }
-        }
+      ? (env: Env | undefined): Iterable<SqlValue[]> =>
+          count(
+            nodes.filter,
+            (function* () {
+              const rowEnv: Env = { row: EMPTY_ROW, outer: env };
+              for (const row of source.rows(env)) {
+                rowEnv.row = row;
+                if (!where(rowEnv)) continue;
+                yield row;
+              }
+            })(),
+          )
       : (env: Env | undefined): Iterable<SqlValue[]> => source.rows(env);
 
     /** Rows ready for projection: filtered source rows, or groups after HAVING. */
@@ -760,41 +845,51 @@ export class QueryCompiler {
       }
     }
 
-    function* produce(env: Env | undefined): Generator<{ out: SqlValue[]; keys: SqlValue[] }> {
+    const groupedCounted = (env: Env | undefined): Iterable<SqlValue[]> => count(nodes.group, grouped(env));
+
+    function* produceRows(env: Env | undefined): Generator<{ out: SqlValue[]; keys: SqlValue[] }> {
       if (!windows.length) {
-        for (const row of grouped(env)) yield project({ row, outer: env });
+        for (const row of groupedCounted(env)) yield project({ row, outer: env });
         return;
       }
-      const all = [...grouped(env)];
+      const all = [...groupedCounted(env)];
       const values = windows.map((w) => evaluateWindow(w, all, env));
       for (let i = 0; i < all.length; i++) {
         yield project({ row: all[i]!.concat(values.map((v) => v[i]!)), outer: env });
       }
     }
 
+    const produce = (env: Env | undefined): Iterable<{ out: SqlValue[]; keys: SqlValue[] }> => count(nodes.project, produceRows(env));
     const run = distinct
-      ? function* (env: Env | undefined) {
-          const seen = new Set<string>();
-          for (const r of produce(env)) {
-            const k = rowKey(r.out);
-            if (seen.has(k)) continue;
-            seen.add(k);
-            yield r;
-          }
-        }
+      ? (env: Env | undefined): Iterable<{ out: SqlValue[]; keys: SqlValue[] }> =>
+          count(
+            nodes.distinct,
+            (function* () {
+              const seen = new Set<string>();
+              for (const r of produce(env)) {
+                const k = rowKey(r.out);
+                if (seen.has(k)) continue;
+                seen.add(k);
+                yield r;
+              }
+            })(),
+          )
       : produce;
 
     let plan = source.plan;
-    if (residual.length) plan = { label: `FILTER ${residual.map(exprToSql).join(" AND ")}`, children: [plan] };
+    if (residual.length) plan = nodes.filter = { label: `FILTER ${residual.map(exprToSql).join(" AND ")}`, children: [plan] };
     if (aggregation) {
       const label = groupExprs.length ? `GROUP BY ${groupExprs.map(exprToSql).join(", ")}` : "AGGREGATE";
       const aggs = aggCalls.length ? ` [${aggCalls.map(exprToSql).join(", ")}]` : "";
       plan = { label: label + aggs, children: [plan] };
       if (core.having) plan = { label: `HAVING ${exprToSql(core.having)}`, children: [plan] };
+      nodes.group = plan;
     }
     if (windowCalls.length) plan = { label: `WINDOW [${windowCalls.map(exprToSql).join(", ")}]`, children: [plan] };
-    plan = { label: `PROJECT ${columns.join(", ")}`, children: [plan] };
-    if (distinct) plan = { label: "DISTINCT", children: [plan] };
+    // Expression subqueries are shown under the projection that evaluates them.
+    const subplans = this.subplanStack[this.subplanStack.length - 1] ?? [];
+    plan = nodes.project = { label: `PROJECT ${columns.join(", ")}`, children: [plan, ...subplans] };
+    if (distinct) plan = nodes.distinct = { label: "DISTINCT", children: [plan] };
 
     return { columns, run, plan, sortable, presorted: orderHint !== undefined && source.ordered === true };
   }
@@ -935,7 +1030,8 @@ export class QueryCompiler {
       place(c, tree, (e) => residual.push(e));
     }
 
-    const source = tree.kind === "leaf" ? this.leafSource(tree, outer, ctes, boundary, orderHint) : this.buildSource(tree, outer, ctes, boundary);
+    const source =
+      tree.kind === "leaf" ? this.withStats(this.leafSource(tree, outer, ctes, boundary, orderHint)) : this.buildSource(tree, outer, ctes, boundary);
     return { source, residual };
   }
 
@@ -995,10 +1091,10 @@ export class QueryCompiler {
   }
 
   private buildSource(node: FromNode, outer: Scope | undefined, ctes: CteMap, boundary: Boundary): Source {
-    if (node.kind === "leaf") return this.leafSource(node, outer, ctes, boundary);
+    if (node.kind === "leaf") return this.withStats(this.leafSource(node, outer, ctes, boundary));
     const left = this.buildSource(node.left, outer, ctes, boundary);
     const right = this.buildSource(node.right, outer, ctes, boundary);
-    return this.joinSource(node, left, right, outer, ctes, boundary);
+    return this.withStats(this.joinSource(node, left, right, outer, ctes, boundary));
   }
 
   private leafSource(leaf: LeafNode, outer: Scope | undefined, ctes: CteMap, boundary: Boundary, order?: OrderHint): Source {
@@ -1175,16 +1271,21 @@ export class QueryCompiler {
           : undefined;
         const filterLabel = rightLeaf.pushed.length ? ` WHERE ${rightLeaf.pushed.map(exprToSql).join(" AND ")}` : "";
         const aliasLabel = rightLeaf.name.toLowerCase() !== table.name.toLowerCase() ? ` AS ${rightLeaf.name}` : "";
+        const searchNode: PlanNode = { label: `SEARCH ${table.name}${aliasLabel} USING INDEX ${index.name} (${index.columns[0]}=?)${filterLabel}`, children: [] };
+        const analyze = this.analyze;
         return {
           columns,
           plan: {
             label: `${joinType} JOIN (index nested loop)${condLabel}`,
-            children: [left.plan, { label: `SEARCH ${table.name}${aliasLabel} USING INDEX ${index.name} (${index.columns[0]}=?)${filterLabel}`, children: [] }],
+            children: [left.plan, searchNode],
           },
           rows: function* (env) {
             for (const l of left.rows(env)) {
               const key = probe({ row: l, outer: env });
               let matched = false;
+              // Each probe of the inner index counts as one loop of the SEARCH node.
+              const stats = analyze ? (searchNode.stats ??= { rows: 0, loops: 0 }) : undefined;
+              if (stats) stats.loops++;
               if (key !== null) {
                 const pv = probeValue(key, table, colIdx);
                 const ids: Iterable<number> = pv === undefined ? table.rowIds() : index.lookup([pv]);
@@ -1192,6 +1293,7 @@ export class QueryCompiler {
                   const r = table.rows.get(id);
                   if (!r) continue;
                   if (rightFilter && !rightFilter({ row: r, outer: env })) continue;
+                  if (stats) stats.rows++;
                   const combined = l.concat(r);
                   if (cond && !cond({ row: combined, outer: env })) continue;
                   matched = true;

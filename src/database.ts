@@ -480,7 +480,16 @@ export class Database {
         const compiler = new QueryCompiler(this.catalog, box);
         const inner = stmt.statement;
         let lines: string[];
-        if (inner.type === "select") {
+        if (inner.type === "select" && stmt.analyze) {
+          const analyzing = new QueryCompiler(this.catalog, box, true);
+          const compiled = analyzing.compileTop(inner);
+          analyzing.beginRun();
+          const start = performance.now();
+          let count = 0;
+          for (const _ of compiled.run()) count++;
+          const ms = performance.now() - start;
+          lines = [...renderPlan(compiled.plan, true), `Execution: ${count} row${count === 1 ? "" : "s"} in ${ms.toFixed(3)} ms`];
+        } else if (inner.type === "select") {
           lines = renderPlan(compiler.compileTop(inner).plan);
         } else {
           const table = this.catalog.getTable(inner.table);

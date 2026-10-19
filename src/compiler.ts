@@ -110,8 +110,11 @@ export interface CompileContext {
    * Compiles a subquery whose scope chain is rooted at `outer`. Returns a
    * function that runs it for a given outer environment.
    */
-  compileSubquery(query: SelectStatement, outer: Scope): SubqueryRunner;
+  compileSubquery(query: SelectStatement, outer: Scope, kind: SubqueryKind): SubqueryRunner;
 }
+
+/** How a subquery is used, for EXPLAIN output. */
+export type SubqueryKind = "SCALAR" | "EXISTS" | "IN";
 
 export interface SubqueryRunner {
   columnCount: number;
@@ -450,7 +453,7 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
 
     case "inSubquery": {
       const operand = compileExpr(expr.operand, scope, ctx);
-      const sub = ctx.compileSubquery(expr.query, scope);
+      const sub = ctx.compileSubquery(expr.query, scope, "IN");
       if (sub.columnCount !== 1) throw new SqlRuntimeError("Subquery in IN must return exactly one column");
       const negated = expr.negated;
       return (env) => {
@@ -471,7 +474,7 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
     }
 
     case "exists": {
-      const sub = ctx.compileSubquery(expr.query, scope);
+      const sub = ctx.compileSubquery(expr.query, scope, "EXISTS");
       const negated = expr.negated;
       return (env) => {
         for (const _ of sub.run(env)) return !negated;
@@ -480,7 +483,7 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
     }
 
     case "subquery": {
-      const sub = ctx.compileSubquery(expr.query, scope);
+      const sub = ctx.compileSubquery(expr.query, scope, "SCALAR");
       if (sub.columnCount !== 1) throw new SqlRuntimeError("Scalar subquery must return exactly one column");
       return (env) => {
         for (const row of sub.run(env)) return row[0]!;
