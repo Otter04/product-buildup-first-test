@@ -18,6 +18,7 @@ import {
   containsSubquery,
   exprToSql,
   hasAggregates,
+  mapExpr,
   predicate,
   Scope,
   splitConjuncts,
@@ -701,10 +702,20 @@ export class QueryCompiler {
       if (hasAggregates(g)) throw new SqlRuntimeError("Aggregate functions are not allowed in GROUP BY");
     }
 
+    // ORDER BY and HAVING may refer to result columns by alias inside expressions
+    // (`ORDER BY a + b` where a and b are aliases); input columns win on a clash.
+    const expandAliases = (expr: Expr): Expr =>
+      mapExpr(expr, (e) => {
+        if (e.kind !== "column" || e.table || scope.findLocal(undefined, e.name) !== undefined) return undefined;
+        const lname = e.name.toLowerCase();
+        return items.find((i) => i.name.toLowerCase() === lname)?.expr;
+      });
+    const having = core.having && expandAliases(core.having);
+
     // ORDER BY terms that name a result column sort on the output value.
     const orderTerms = orderBy.map((o) => {
       const pos = outputPosition(o.expr, columns, true);
-      return { item: o, pos };
+      return { item: pos === undefined ? { ...o, expr: expandAliases(o.expr) } : o, pos };
     });
 
     const misplacedWindows = (expr: Expr | undefined, clause: string): void => {
@@ -713,12 +724,12 @@ export class QueryCompiler {
       collectWindows(expr, found);
       if (found.length) throw new SqlRuntimeError(`Window functions are not allowed in ${clause}`);
     };
-    misplacedWindows(core.having, "HAVING");
+    misplacedWindows(having, "HAVING");
     for (const g of groupExprs) misplacedWindows(g, "GROUP BY");
 
     const aggCalls: FunctionCallExpr[] = [];
     for (const i of items) collectAggregates(i.expr, aggCalls);
-    if (core.having) collectAggregates(core.having, aggCalls);
+    if (having) collectAggregates(having, aggCalls);
     for (const t of orderTerms) if (t.pos === undefined) collectAggregates(t.item.expr, aggCalls);
     const aggregated = aggCalls.length > 0 || groupExprs.length > 0;
     if (core.having && !aggregated) throw new SqlRuntimeError("HAVING requires GROUP BY or an aggregate function");
@@ -732,11 +743,23 @@ export class QueryCompiler {
         }
       | undefined;
     if (aggregated) {
+      // Structurally identical calls (e.g. SUM(x) in SELECT and ORDER BY) share one accumulator.
       const slots = new Map<FunctionCallExpr, number>();
-      const hidden: ColumnInfo[] = aggCalls.map((call, i) => {
-        slots.set(call, source.columns.length + i);
-        return { name: `__agg${i}`, hidden: true };
-      });
+      const unique = new Map<string, number>();
+      const distinctCalls: FunctionCallExpr[] = [];
+      for (const call of aggCalls) {
+        const key = JSON.stringify(call);
+        let slot = unique.get(key);
+        if (slot === undefined) {
+          slot = source.columns.length + distinctCalls.length;
+          unique.set(key, slot);
+          distinctCalls.push(call);
+        }
+        slots.set(call, slot);
+      }
+      aggCalls.length = 0;
+      aggCalls.push(...distinctCalls);
+      const hidden: ColumnInfo[] = aggCalls.map((_, i) => ({ name: `__agg${i}`, hidden: true }));
       projScope = new Scope([...source.columns, ...hidden], outer, boundary, slots);
       aggregation = {
         groups: groupExprs.map((g) => compileExpr(g, scope, ctx)),
@@ -746,7 +769,7 @@ export class QueryCompiler {
           createAccumulator(call.name, call.args.length, call.star, call.distinct);
           return { args, make: () => createAccumulator(call.name, call.args.length, call.star, call.distinct) };
         }),
-        having: core.having ? predicate(compileExpr(core.having, projScope, ctx)) : undefined,
+        having: having ? predicate(compileExpr(having, projScope, ctx)) : undefined,
       };
     }
 
@@ -799,7 +822,15 @@ export class QueryCompiler {
     });
 
     // Plan nodes are created at the end; the stage generators below only read them at run time.
-    const nodes: { filter?: PlanNode; group?: PlanNode; project?: PlanNode; distinct?: PlanNode } = {};
+    const nodes: { filter?: PlanNode; group?: PlanNode; having?: PlanNode; window?: PlanNode; project?: PlanNode; distinct?: PlanNode } = {};
+    const analyze = this.analyze;
+    /** Records one output row of `node` (EXPLAIN ANALYZE), for stages that are not separate generators. */
+    const bump = (node: PlanNode | undefined, started = false): void => {
+      if (!analyze || !node) return;
+      const stats = (node.stats ??= { rows: 0, loops: 0 });
+      if (started) stats.loops++;
+      else stats.rows++;
+    };
     const count = <T>(node: PlanNode | undefined, rows: Iterable<T>): Iterable<T> => (node ? this.counted(node, rows) : rows);
     const filtered = where
       ? (env: Env | undefined): Iterable<SqlValue[]> =>
@@ -838,14 +869,18 @@ export class QueryCompiler {
       if (groups.size === 0 && aggregation.groups.length === 0) {
         groups.set("", { rep: source.columns.map(() => null), accs: aggregation.calls.map((c) => c.make()) });
       }
+      bump(nodes.group, true);
+      bump(nodes.having, true);
       for (const group of groups.values()) {
         const aggRow = [...group.rep, ...group.accs.map((a) => a.result())];
+        bump(nodes.group);
         if (aggregation.having && !aggregation.having({ row: aggRow, outer: env })) continue;
+        bump(nodes.having);
         yield aggRow;
       }
     }
 
-    const groupedCounted = (env: Env | undefined): Iterable<SqlValue[]> => count(nodes.group, grouped(env));
+    const groupedCounted = grouped;
 
     function* produceRows(env: Env | undefined): Generator<{ out: SqlValue[]; keys: SqlValue[] }> {
       if (!windows.length) {
@@ -853,6 +888,8 @@ export class QueryCompiler {
         return;
       }
       const all = [...groupedCounted(env)];
+      bump(nodes.window, true);
+      for (let i = 0; i < all.length; i++) bump(nodes.window);
       const values = windows.map((w) => evaluateWindow(w, all, env));
       for (let i = 0; i < all.length; i++) {
         yield project({ row: all[i]!.concat(values.map((v) => v[i]!)), outer: env });
@@ -881,11 +918,10 @@ export class QueryCompiler {
     if (aggregation) {
       const label = groupExprs.length ? `GROUP BY ${groupExprs.map(exprToSql).join(", ")}` : "AGGREGATE";
       const aggs = aggCalls.length ? ` [${aggCalls.map(exprToSql).join(", ")}]` : "";
-      plan = { label: label + aggs, children: [plan] };
-      if (core.having) plan = { label: `HAVING ${exprToSql(core.having)}`, children: [plan] };
-      nodes.group = plan;
+      plan = nodes.group = { label: label + aggs, children: [plan] };
+      if (core.having) plan = nodes.having = { label: `HAVING ${exprToSql(core.having)}`, children: [plan] };
     }
-    if (windowCalls.length) plan = { label: `WINDOW [${windowCalls.map(exprToSql).join(", ")}]`, children: [plan] };
+    if (windowCalls.length) plan = nodes.window = { label: `WINDOW [${windowCalls.map(exprToSql).join(", ")}]`, children: [plan] };
     // Expression subqueries are shown under the projection that evaluates them.
     const subplans = this.subplanStack[this.subplanStack.length - 1] ?? [];
     plan = nodes.project = { label: `PROJECT ${columns.join(", ")}`, children: [plan, ...subplans] };

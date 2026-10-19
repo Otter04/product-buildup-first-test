@@ -178,6 +178,47 @@ export function walkExpr(expr: Expr, visit: (e: Expr) => boolean | void): void {
   }
 }
 
+/**
+ * Rebuilds an expression bottom-up. `replace` may return a substitute for a
+ * node (which is not visited further); subqueries are left untouched.
+ */
+export function mapExpr(expr: Expr, replace: (e: Expr) => Expr | undefined): Expr {
+  const sub = replace(expr);
+  if (sub) return sub;
+  const m = (e: Expr): Expr => mapExpr(e, replace);
+  switch (expr.kind) {
+    case "unary":
+      return { ...expr, operand: m(expr.operand) };
+    case "binary":
+      return { ...expr, left: m(expr.left), right: m(expr.right) };
+    case "isNull":
+      return { ...expr, operand: m(expr.operand) };
+    case "between":
+      return { ...expr, operand: m(expr.operand), low: m(expr.low), high: m(expr.high) };
+    case "inList":
+      return { ...expr, operand: m(expr.operand), list: expr.list.map(m) };
+    case "inSubquery":
+      return { ...expr, operand: m(expr.operand) };
+    case "like":
+      return { ...expr, operand: m(expr.operand), pattern: m(expr.pattern), escape: expr.escape && m(expr.escape) };
+    case "case":
+      return {
+        ...expr,
+        operand: expr.operand && m(expr.operand),
+        branches: expr.branches.map((b) => ({ when: m(b.when), then: m(b.then) })),
+        elseExpr: expr.elseExpr && m(expr.elseExpr),
+      };
+    case "cast":
+      return { ...expr, operand: m(expr.operand) };
+    case "function":
+      // Keep the node identity of calls without arguments to rewrite (aggregate slots are keyed by node).
+      if (expr.args.length === 0) return expr;
+      return { ...expr, args: expr.args.map(m) };
+    default:
+      return expr;
+  }
+}
+
 /** True if the expression contains any subquery. */
 export function containsSubquery(expr: Expr): boolean {
   let found = false;

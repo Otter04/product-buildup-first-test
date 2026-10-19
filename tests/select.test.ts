@@ -181,3 +181,29 @@ describe("expressions", () => {
     expect(value("CAST(NULL AS INTEGER)")).toBeNull();
   });
 });
+
+describe("result aliases inside expressions", () => {
+  const db = sampleDb();
+
+  it("can be used in ORDER BY expressions", () => {
+    expect(
+      rows(db, "SELECT name, salary / 1000 AS k, dept_id * 10 AS d FROM employees WHERE dept_id IS NOT NULL ORDER BY d - k LIMIT 2"),
+    ).toEqual([
+      ["Alice", 180, 10],
+      ["Carol", 125, 10],
+    ]);
+  });
+
+  it("can be used in HAVING", () => {
+    expect(rows(db, "SELECT dept_id, COUNT(*) AS n FROM employees GROUP BY dept_id HAVING n > 1 ORDER BY dept_id")).toEqual([
+      [1, 3],
+      [2, 2],
+    ]);
+    expect(rows(db, "SELECT dept_id, SUM(salary) AS total FROM employees GROUP BY dept_id HAVING total / 2 > 100000")).toEqual([[1, 425000]]);
+  });
+
+  it("prefers input columns over aliases with the same name", () => {
+    // `salary` inside the expression is the column, not the alias.
+    expect(column(db, "SELECT name, -salary AS salary FROM employees ORDER BY salary + 0 LIMIT 1")).toEqual(["Grace"]);
+  });
+});

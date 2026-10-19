@@ -52,7 +52,8 @@
     "prepublishOnly": "npm run build",
     "bench": "npm run build && node --no-warnings bench/bench.mjs",
     "examples": "npm run build && node examples/quickstart.mjs && node examples/analytics.mjs && node examples/todo.mjs list",
-    "fuzz": "vitest run tests/differential.test.ts"
+    "fuzz": "vitest run tests/differential.test.ts",
+    "site": "npm run build && node scripts/build-site.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
