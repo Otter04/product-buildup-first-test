@@ -1,18 +1,49 @@
 {
-  "name": "out",
+  "name": "minisql",
   "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
+  "description": "A small, dependency-free relational SQL database engine written in TypeScript \u2014 lexer, parser, planner, executor, indexes, transactions and a REPL.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "minisql": "dist/cli.js"
   },
-  "dependencies": {
-    "@google/generative-ai": "^0.24.1",
-    "framer-motion": "^12.40.0",
-    "next": "16.2.4",
-    "react": "19.2.4",
-    "react-dom": "19.2.4"
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "repl": "npm run build && node dist/cli.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "sql",
+    "database",
+    "parser",
+    "interpreter",
+    "query-engine",
+    "typescript"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
   }
 }
