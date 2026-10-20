@@ -33,8 +33,96 @@ PROJECT name, SUM(o.total)
 
 ![The minisql playground running a window-function query in the browser](docs/images/playground.png)
 
+## 목적과 활용 방법 (한국어 안내)
+
+### 이 프로젝트는 무엇을 위한 것인가요?
+
+minisql은 **외부 라이브러리 없이 TypeScript만으로 처음부터 만든 관계형 SQL 데이터베이스 엔진**입니다.
+SQLite 같은 데이터베이스가 내부에서 어떻게 동작하는지(파싱 → 실행 계획 → 인덱스 → 트랜잭션)를
+직접 구현해 보여 주는 것이 목적이며, 동시에 실제로 쓸 수 있는 가벼운 임베디드 DB이기도 합니다.
+
+### 무엇을 할 수 있나요?
+
+| 용도 | 설명 |
+| --- | --- |
+| **데이터베이스 내부 학습** | 렉서, 파서, 쿼리 플래너, B+ 트리 인덱스, 해시 조인, Undo 저널 기반 트랜잭션 등을 읽기 쉬운 코드(약 8천 줄)로 공부할 수 있습니다. `EXPLAIN ANALYZE`로 플래너가 어떤 결정을 내렸는지 바로 확인할 수 있습니다. |
+| **SQL 연습 / 교육** | 브라우저 플레이그라운드에서 설치 없이 조인, 서브쿼리, 재귀 CTE, 윈도 함수를 실습할 수 있습니다. 강의·스터디 자료로 쓰기 좋습니다. |
+| **가벼운 임베디드 DB** | Node.js 앱, CLI 도구, 테스트 코드 안에서 메모리 DB로 사용하고, 필요하면 `.json` / `.sql` 파일로 저장할 수 있습니다. 네이티브 빌드가 필요 없습니다. |
+| **브라우저 안의 SQL** | 런타임 의존성이 없어 프런트엔드에서도 그대로 동작합니다. 대시보드나 데모 페이지에서 클라이언트 측 데이터 분석에 활용할 수 있습니다. |
+| **테스트용 가짜 DB** | 단위 테스트에서 실제 DB 서버 대신 빠르게 띄우고 버리는 SQL 저장소로 쓸 수 있습니다. |
+| **포트폴리오 / 참고 구현** | SQLite와의 차분 퍼징(differential fuzzing), 벤치마크, CI까지 갖춘 엔지니어링 사례로 참고할 수 있습니다. |
+
+### 어떻게 사용하나요?
+
+**1. 설치 및 빌드**
+
+```sh
+git clone https://github.com/otter04/product-buildup-first-test.git minisql
+cd minisql
+npm install
+npm run build
+```
+
+**2. 대화형 셸(CLI)로 사용하기**
+
+```sh
+node dist/cli.js                 # 메모리 DB로 시작
+node dist/cli.js mydata.json     # 파일 DB (변경 사항이 자동 저장됨)
+node dist/cli.js -e "SELECT 1 + 1;"          # 한 줄 실행
+node dist/cli.js -m csv < report.sql > out.csv   # 스크립트 실행 후 CSV로 출력
+```
+
+셸 안에서는 `.tables`, `.schema`, `.dump`, `.mode csv`, `.timer on`, `.help` 같은 명령을 쓸 수 있습니다.
+
+**3. 코드에서 라이브러리로 사용하기**
+
+```ts
+import { Database } from "minisql";
+
+const db = new Database();
+db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+db.run("INSERT INTO users (name) VALUES (?)", ["홍길동"]);
+console.log(db.query("SELECT * FROM users")); // [{ id: 1, name: "홍길동" }]
+
+// 같은 쿼리를 반복 실행할 때는 prepare()로 계획을 재사용
+const find = db.prepare("SELECT name FROM users WHERE id = ?");
+find.get([1]); // { name: "홍길동" }
+
+// 트랜잭션: 예외가 나면 전부 롤백
+db.transaction((tx) => {
+  tx.run("INSERT INTO users (name) VALUES (?)", ["김철수"]);
+});
+```
+
+파일 저장이 필요하면 `minisql/node`의 `openDatabase` / `saveDatabase`를 사용합니다.
+
+**4. 브라우저 플레이그라운드**
+
+```sh
+npm run site
+python3 -m http.server -d site   # http://localhost:8000 접속
+```
+
+GitHub의 *Settings → Pages → Source: GitHub Actions*를 켜 두면 `main`에 push할 때마다 자동으로 배포됩니다.
+
+**5. 그 밖의 명령**
+
+```sh
+npm test           # 전체 테스트
+npm run fuzz       # SQLite와 결과를 비교하는 차분 퍼징 (Node 22 이상)
+npm run bench      # SQLite 대비 성능 벤치마크
+npm run examples   # examples/ 폴더의 예제 실행
+```
+
+### 한계
+
+모든 데이터는 메모리에 있고 파일 저장은 스냅샷 방식이라, 대용량 데이터나 여러 프로세스가 동시에 쓰는
+운영 환경용 DB를 대신하지는 않습니다. 학습, 도구, 테스트, 소규모 데이터에 알맞습니다.
+SQLite와의 차이는 아래 [Differences from SQLite](#differences-from-sqlite)를 참고하세요.
+
 ## Contents
 
+- [목적과 활용 방법 (한국어 안내)](#목적과-활용-방법-한국어-안내)
 - [Features](#features)
 - [Browser playground](#browser-playground)
 - [Getting started](#getting-started)
