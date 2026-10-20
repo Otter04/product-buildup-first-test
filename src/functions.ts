@@ -1,4 +1,5 @@
 import { SqlCatalogError, SqlRuntimeError } from "./errors.js";
+import { JsonGroupArray, JsonGroupObject } from "./jsonsql.js";
 import {
   castValue,
   compareValues,
@@ -597,6 +598,8 @@ export const AGGREGATE_FUNCTIONS: Record<string, AggregateFunction> = {
   MIN: aggregate(1, 1, () => new ExtremeAcc(-1)),
   MAX: aggregate(1, 1, () => new ExtremeAcc(1)),
   GROUP_CONCAT: aggregate(1, 2, () => new GroupConcatAcc(",")),
+  JSON_GROUP_ARRAY: aggregate(1, 1, () => new JsonGroupArray(false)),
+  JSON_GROUP_OBJECT: aggregate(2, 2, () => new JsonGroupObject(false)),
   STRING_AGG: aggregate(2, 2, () => new GroupConcatAcc(",")),
   BOOL_AND: aggregate(1, 1, () => new BoolAcc(true)),
   BOOL_OR: aggregate(1, 1, () => new BoolAcc(false)),
@@ -620,14 +623,22 @@ export function isAggregateCall(name: string, argc: number, star: boolean): bool
   return name in AGGREGATE_FUNCTIONS;
 }
 
-export function createAccumulator(name: string, argc: number, star: boolean, distinct: boolean): Accumulator {
+export function createAccumulator(name: string, argc: number, star: boolean, distinct: boolean, jsonArg = false): Accumulator {
   const def = AGGREGATE_FUNCTIONS[name];
   if (!def) throw new SqlCatalogError(`Unknown aggregate function ${name}()`);
   if (!star && (argc < def.minArgs || argc > def.maxArgs)) {
     throw new SqlCatalogError(`${name}() takes ${def.minArgs === def.maxArgs ? def.minArgs : `${def.minArgs} to ${def.maxArgs}`} argument(s), got ${argc}`);
   }
   if (name === "COUNT" && !star && argc === 0) throw new SqlRuntimeError("COUNT() requires an argument or *");
-  const acc = name === "COUNT" ? new CountAcc(star) : def.create();
+  // JSON aggregates nest JSON-producing arguments (e.g. json_object(...)) instead of quoting them.
+  const acc =
+    name === "COUNT"
+      ? new CountAcc(star)
+      : name === "JSON_GROUP_ARRAY"
+        ? new JsonGroupArray(jsonArg)
+        : name === "JSON_GROUP_OBJECT"
+          ? new JsonGroupObject(jsonArg)
+          : def.create();
   return distinct ? new DistinctAcc(acc) : acc;
 }
 

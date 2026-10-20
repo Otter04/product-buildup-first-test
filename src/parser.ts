@@ -1020,7 +1020,11 @@ export class Parser {
 
   private parseConcat(): Expr {
     let left = this.parseUnary();
-    while (this.matchOperator("||")) left = { kind: "binary", op: "||", left, right: this.parseUnary() };
+    // `||`, `->` and `->>` share the highest binary precedence, as in SQLite.
+    while (this.isOperator("||") || this.isOperator("->") || this.isOperator("->>")) {
+      const op = this.next().value as BinaryOp;
+      left = { kind: "binary", op, left, right: this.parseUnary() };
+    }
     return left;
   }
 

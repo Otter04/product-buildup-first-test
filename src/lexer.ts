@@ -126,7 +126,7 @@ export const KEYWORDS = new Set([
   "ANALYZE",
 ]);
 
-const TWO_CHAR_OPERATORS = new Set(["<=", ">=", "<>", "!=", "||", "=="]);
+const TWO_CHAR_OPERATORS = new Set(["<=", ">=", "<>", "!=", "||", "==", "->"]);
 const ONE_CHAR_OPERATORS = new Set(["+", "-", "*", "/", "%", "=", "<", ">"]);
 const PUNCTUATION = new Set(["(", ")", ",", ";", "."]);
 
@@ -290,6 +290,11 @@ export function tokenize(source: string): Token[] {
       continue;
     }
 
+    if (source.startsWith("->>", pos)) {
+      advance(3);
+      push("operator", "->>");
+      continue;
+    }
     const two = source.slice(pos, pos + 2);
     if (TWO_CHAR_OPERATORS.has(two)) {
       advance(2);

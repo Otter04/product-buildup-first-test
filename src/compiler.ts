@@ -3,6 +3,7 @@ import { SqlCatalogError, SqlRuntimeError } from "./errors.js";
 import { glob, isAggregateCall, like, lookupScalar } from "./functions.js";
 import { castValue, sqlCompare, toBool, toNumber, toText, type SqlValue } from "./values.js";
 import { WINDOW_ONLY_FUNCTIONS } from "./window.js";
+import { compileArrow, compileJsonCall, JSON_SCALARS } from "./jsonsql.js";
 
 /** One column visible to expressions at some query level. */
 export interface ColumnInfo {
@@ -423,6 +424,7 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
     }
 
     case "binary": {
+      if (expr.op === "->" || expr.op === "->>") return compileArrow(expr, (e) => compileExpr(e, scope, ctx));
       const left = compileExpr(expr.left, scope, ctx);
       const right = compileExpr(expr.right, scope, ctx);
       const op = expr.op;
@@ -592,6 +594,7 @@ export function compileExpr(expr: Expr, scope: Scope, ctx: CompileContext): Comp
       }
       if (expr.star) throw new SqlRuntimeError(`${expr.name}(*) is not valid`);
       if (expr.distinct) throw new SqlRuntimeError(`DISTINCT is only allowed in aggregate functions`);
+      if (JSON_SCALARS[expr.name]) return compileJsonCall(expr, (e) => compileExpr(e, scope, ctx));
       const fn = lookupScalar(expr.name, expr.args.length);
       const args = expr.args.map((a) => compileExpr(a, scope, ctx));
       // Short-circuit COALESCE / IFNULL / IIF so unused branches are not evaluated.

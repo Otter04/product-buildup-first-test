@@ -48,6 +48,7 @@ SQLite 같은 데이터베이스가 내부에서 어떻게 동작하는지(파�
 | **데이터베이스 내부 학습** | 렉서, 파서, 쿼리 플래너, B+ 트리 인덱스, 해시 조인, Undo 저널 기반 트랜잭션 등을 읽기 쉬운 코드(약 8천 줄)로 공부할 수 있습니다. `EXPLAIN ANALYZE`로 플래너가 어떤 결정을 내렸는지 바로 확인할 수 있습니다. |
 | **SQL 연습 / 교육** | 브라우저 플레이그라운드에서 설치 없이 조인, 서브쿼리, 재귀 CTE, 윈도 함수를 실습할 수 있습니다. 강의·스터디 자료로 쓰기 좋습니다. |
 | **가벼운 임베디드 DB** | Node.js 앱, CLI 도구, 테스트 코드 안에서 메모리 DB로 사용하고, 필요하면 `.json` / `.sql` 파일로 저장할 수 있습니다. 네이티브 빌드가 필요 없습니다. |
+| **JSON 문서 처리** | JSON 텍스트 컬럼을 `->>`, `json_extract`로 조회하고 `json_object`, `json_group_array`로 결과를 JSON으로 만들 수 있습니다. |
 | **브라우저 안의 SQL** | 런타임 의존성이 없어 프런트엔드에서도 그대로 동작합니다. 대시보드나 데모 페이지에서 클라이언트 측 데이터 분석에 활용할 수 있습니다. |
 | **테스트용 가짜 DB** | 단위 테스트에서 실제 DB 서버 대신 빠르게 띄우고 버리는 SQL 저장소로 쓸 수 있습니다. |
 | **포트폴리오 / 참고 구현** | SQLite와의 차분 퍼징(differential fuzzing), 벤치마크, CI까지 갖춘 엔지니어링 사례로 참고할 수 있습니다. |
@@ -146,6 +147,7 @@ SQLite와의 차이는 아래 [Differences from SQLite](#differences-from-sqlite
 | **Set operations** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`, standalone `VALUES` |
 | **CTEs** | `WITH`, `WITH RECURSIVE` (with cycle-safe `UNION` and a runaway-recursion guard) |
 | **Window functions** | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, and every aggregate with `OVER (PARTITION BY … ORDER BY … ROWS/RANGE BETWEEN …)`; named windows (`WINDOW w AS …`) |
+| **JSON** | `json_extract`, `json_object`, `json_array`, `json_set` / `insert` / `replace` / `remove`, `json_patch`, `json_type`, `json_valid`, `json_array_length`, `->` and `->>`, `json_group_array` / `json_group_object` — checked against SQLite's JSON1 |
 | **Aggregates** | `COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`/`STRING_AGG`, `BOOL_AND`/`BOOL_OR`, `VARIANCE`, `STDDEV`, `MEDIAN`, plus `DISTINCT` |
 | **Writes** | `INSERT … VALUES / SELECT / DEFAULT VALUES`, `UPDATE`, `DELETE`, upserts (`ON CONFLICT … DO NOTHING / DO UPDATE`), `INSERT OR IGNORE / OR REPLACE`, `REPLACE INTO`, `RETURNING` |
 | **Schema** | `CREATE/DROP TABLE`, `CREATE TABLE … AS SELECT`, `ALTER TABLE` (add / drop / rename column, rename table), `CREATE [UNIQUE] INDEX`, `CREATE VIEW` |
@@ -478,6 +480,8 @@ src/
   planner.ts      FROM-clause planning, access paths, joins, aggregation, CTEs, EXPLAIN
   window.ts       window function evaluation
   functions.ts    scalar and aggregate functions, LIKE / GLOB
+  json.ts         JSON parser, paths and edits
+  jsonsql.ts      JSON functions and the -> / ->> operators
   values.ts       value semantics: comparison, coercion, casting
   btree.ts        B+ tree
   storage.ts      tables, indexes, catalog, undo journal

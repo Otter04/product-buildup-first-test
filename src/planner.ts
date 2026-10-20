@@ -35,6 +35,7 @@ import {
 import { SqlCatalogError, SqlRuntimeError } from "./errors.js";
 import { createAccumulator, type Accumulator } from "./functions.js";
 import type { Catalog, Index, Table } from "./storage.js";
+import { isJsonProducer } from "./jsonsql.js";
 import { evaluateWindow, validateWindowCall, type CompiledWindow } from "./window.js";
 import { compareValues, rowKey, toBool, toNumber, type SqlValue } from "./values.js";
 
@@ -767,7 +768,8 @@ export class QueryCompiler {
           const args = call.args.map((a) => compileExpr(a, scope, ctx));
           // Validate arity eagerly so errors surface even on empty input.
           createAccumulator(call.name, call.args.length, call.star, call.distinct);
-          return { args, make: () => createAccumulator(call.name, call.args.length, call.star, call.distinct) };
+          const jsonArg = call.args.length > 0 && isJsonProducer(call.args[call.args.length - 1]!);
+          return { args, make: () => createAccumulator(call.name, call.args.length, call.star, call.distinct, jsonArg) };
         }),
         having: having ? predicate(compileExpr(having, projScope, ctx)) : undefined,
       };
